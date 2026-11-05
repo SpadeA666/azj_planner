@@ -1,0 +1,24 @@
+# 构建产物
+build/
+devel/
+install/
+*.o
+*.so
+*.a
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# 运行时产物
+*.bag
+*.bag.active
+*.log

@@ -1,0 +1,395 @@
+# Azj Planner 配置
+#
+# 说明：
+#   rog_map 段是给 ROG-Map 建图用的（本包只读它的 ESDF，不修改其源码）。
+#   azj 段是本规划器自己的参数。
+#
+# 与 SUPER/EGO 的差别在于**目标函数的形式**，不在某个参数的取值：
+#   它们把 clearance 当阈值（充足时代价恒为 0 → 贴边）；
+#   这里把 clearance 当连续收益（代价 = 长度 × (1 + w·(ref/c)^alpha)）。
+# 长度仍是主目标，居中是有界修正，所以 w 保持在 0.05~0.2 量级。
+
+rog_map:
+  # ⚠ 本段整体照抄 SUPER 能跑通的配置（super_planner/config/click_smooth_ros1.yaml），
+  #   只改三处必要项：esdf/enable、esdf/local_update_box、ros_callback 的话题。
+  #
+  #   为什么必须照抄 raycasting 那一组：曾漏掉它，用了 rog_map 的默认值
+  #   p_miss=0.7 → l_miss = log(0.7/0.3) = +0.847（**正数**），
+  #   意味着 raycast 穿过的"空闲"格子反而在增加占据概率。
+  #   结果整个房间只增不减，全被填成实心 —— 表现就是建图糊成一坨、
+  #   任何位置 clearance 都只有 0.03~0.09m、规划器报 fully blocked。
+  #   启动日志里能直接看出来："[ROG] l_hit: 0.847  l_miss: 0.847"（两者相同即错）。
+  resolution: 0.10
+  inflation_resolution: 0.10
+  # ★ 必须是 1。这个值会**双向侵蚀** virtual_ground/ceil_height
+  #   （rog_map config.hpp:407 起）：
+  #     ground_eff = ground + inflation_step*resolution
+  #     ceil_eff   = ceil   - inflation_step*resolution
+  #   设 3 就是各吃 0.3m —— 实测配 ceil=1.0/ground=-0.2 时
+  #   实际变成 ceil=0.65/ground=0.15，飞机飞 0.8 直接"above virtual ceil"，
+  #   整帧点云被丢弃、地图永远空。
+  #   膨胀的职责交给规划器的 robot_radius，不要让建图参数兼职。
+  inflation_step: 1
+  unk_inflation_en: false
+  unk_inflation_step: 1
+  map_size: [ 50, 50, 6 ]
+  fix_map_origin: [ 0, 0, 1.5 ]
+  frontier_extraction_en: false
+
+  # z 方向点云裁剪边界。
+  #
+  # ⚠ 这两个值经过 inflation_step 侵蚀后才是真正生效的（见上面 inflation_step 说明）：
+  #   ground_eff = floor(ground/res)*res + step*res + 0.05
+  #   ceil_eff   = floor(ceil /res)*res - step*res - 0.05
+  # 节点启动日志会打印 "resetMapSize: virtual_ceil_height: X, virtual_ground_height: Y"，
+  # 那是**实际生效值**，以它为准。
+  #
+  # 要求：
+  #   · ceil_eff  > 最高飞行高度 + 0.5m   （否则点云被丢弃）
+  #   · ground_eff < 0                    （否则飞机在地面时就报警）
+  # 当前 inflation_step=1 时：
+  #   ceil 1.8 → eff 1.65   ground -0.3 → eff -0.15
+  # 飞得更高就把 ceil 往上加（比如飞 1.5m 时设 2.5）。
+  virtual_ceil_height: 1.8
+  virtual_ground_height: -0.3
+
+  load_pcd_en: false
+
+  intensity_thresh: -10
+  point_filt_num: 1
+
+  raycasting:
+    enable: true
+    batch_update_size: 1
+    local_update_box: [ 100, 100, 5 ]
+    # ray_range_min=0.5 滤掉机体近距自反射（机臂/桨）。
+    # 注意 ray_range 同时决定 free 更新的起点，不能太大，
+    # 否则飞机周围一圈永远不更新为 free。
+    ray_range: [ 0.5, 15 ]
+    p_min: 0.12
+    p_miss: 0.49        # ★ 必须 < 0.5！否则 l_miss 为正，free 更新反向
+    p_free: 0.499
+    p_occ: 0.85
+    p_hit: 0.9
+    p_max: 0.98
+    unk_thresh: 1.0
+
+  map_sliding:
+    enable: true
+    threshold: 0.3
+
+  esdf:
+    enable: true              # ★ 本规划器需要 ESDF（SUPER 不用，它走多面体）
+    resolution: 0.10
+    # ★ 以 odom 为中心的全量重算盒（不是增量！`updateESDF3D` 每帧重算整个盒）。
+    #
+    # 原来的 [8,8,4] 只有半径 4m，而打点常在 10~15m 外：盒外的
+    # distance_buffer 从未被写过（vector<double> resize 填 0），
+    # evaluateEDT 插值读到一片 0 → clearance 变 0 →
+    # 日志 `goal clearance=0` + `plan failed: fully blocked`。
+    #
+    # xy 取 32（**半径 16m**）覆盖实际打点距离 —— 实测用户会打到 15m 外，
+    # 半径 12m 时目标已在盒外，路径后段全在未建图区（详见
+    # `azj_planner_node.cpp:clearanceAt` 里盒外返回 -1 的注释）。
+    # z 只需覆盖 floor_z..ceil_z 加膨胀（实测 map z bounds ≈ [-0.2,1.6]），
+    # 所以 z=2 就够，不必跟着 xy 放大 —— z 是全量重算的体积因子。
+    # 体积 = 320×320×20 = 2.05M 格。
+    # 若机器吃不消，优先缩 z 或降 resolution，别缩 xy（会重新出现“目标在盒外”）。
+    local_update_box: [ 32, 32, 2 ]
+
+  ros_callback:
+    enable: true
+    # cloud_topic：super_data_fix 输出的 map 系点云（已用真值位姿变换）
+    cloud_topic: "/super_cloud"
+    # odom_topic：**必须与点云的变换位姿同源**。
+    #   仿真用 gazebo 真值，脚本会把这里 sed 成 /gazebo_truth/odom。
+    #   若用 MAVROS 或 LIO，会与 super_data_fix 的变换基准产生 2~9cm 相对错动，
+    #   点云在每帧被放到略微不同的位置，墙就变厚。
+    odom_topic: "/gazebo_truth/odom"
+    odom_timeout: 2.0
+
+  visualization:
+    enable: true
+    use_dynamic_reconfigure: false
+    time_rate: 2
+    frame_rate: 0
+    range: [ 15, 15, 8 ]
+    frame_id: "map"
+    pub_unknown_map_en: false
+
+azj:
+  # ---- 搜索 ----
+  resolution: 0.10          # A* 栅格分辨率
+  replan_rate: 5.0          # 重规划检查频率 [Hz]（注意：只在需要时才真重建轨迹）
+
+  # ---- 输出 / 与控制器对接 ----
+  # 发布 quadrotor_msgs/PositionCommand，与 SUPER/EGO 同一约定。
+  # as_controller 的 navigationIso / navigationContour / navigationOMMPC 可直接跟踪。
+  # ⚠ cmd_topic 与 SUPER/EGO 共用，一次只能跑一个规划器。
+  cmd_topic: "/planning/pos_cmd"
+  publish_rate: 50.0        # 参考点发布频率 [Hz]，必须 > 2Hz（控制器 traj_timeout=0.5s）
+  # 速度反馈话题。**留空 = 从建图用的那个 odom 的 twist 取速度**（推荐）。
+  # 这样仿真(/gazebo_truth/odom)与真机(mavros odom)都不用改，且位姿/速度严格同源。
+  # 只有需要独立速度源时才填，例如 /mavros/local_position/velocity_local
+  vel_topic: ""
+  arrive_tol: 0.15          # 到达判定距离 [m]
+                            # ★ 0.25 → 0.15（2026-11-05）：实测悬停稳态误差
+                            #   0.226m ≈ 旧 arrive_tol 0.25，即飞机一进 0.25m 球
+                            #   就被判“到达”并丢弃轨迹，于是**永远停在球边缘**。
+                            #   实测误差能收敛到 0.037~0.149m，所以 0.15 可达。
+  goal_yaw: .nan            # 固定目标 yaw；nan = 按 yaw_follow_velocity 决定
+  # 机头是否朝速度方向。**默认 false**：打点只要求"飞过去"，不该顺带转向。
+  # 曾经无条件朝速度方向且无速率限制 → 目标在身后时 yaw 阶跃 180°
+  # → PX4 急转 → 姿态/高度失控 → 掉落（仿真里表现为"打点后直接旋转降落"）。
+  yaw_follow_velocity: false
+  # yaw 参考最大变化率 [rad/s]，对齐 SUPER 的 yaw_dot_max: 1.5。
+  # 即使开启跟随也只缓慢转，绝不阶跃。
+  yaw_rate_max: 1.5
+  replan_lead: 0.10         # 轨迹剩余时间小于它就重规划 [s]
+                            # ★ 0.50 → 0.10（2026-11-05）：这是“到点过冲”的主因。
+                            #   1.0m/s 下刹车距离 = v²/(2a) = 0.33m、需 0.67s，
+                            #   而 replan_lead=0.5s 时轨迹**还没进入减速段就被丢弃**
+                            #   重规划 → v_ref 从 0.62 直接跳 0（实测断崖），
+                            #   飞机以 0.6~1.0m/s 凭 PX4 位置环硬刹车 → 冲过 0.2~0.3m。
+                            #   0.10s 让轨迹先完成减速，过冲基本消失。
+                            #   安全性不受影响：障碍侵入由 needReplan (c) 独立触发。
+  replan_deviation: 0.50    # 偏离参考点超过它就重规划 [m]
+  safety_lookahead: 0.50    # 前方安全监控前瞻 [s]，参考点被障碍侵入则立刻重规划
+  min_replan_period: 0.30   # 重规划最小间隔 [s]。机制性防活锁兜底：
+                            #   实测一次完整规划 1.5~1.7s，不影响正常重规划；
+                            #   只在"规划→被拒→重规划"异常循环时刹车，
+                            #   防止主线程 100% CPU 导致 /planning/pos_cmd 断流
+
+  # ---- 2D / 3D 模式 ----
+  # false = 完整 3D 规划（默认）
+  # true  = 只在 XY 平面规划，高度锁在**目标高度**
+  #
+  # 运行时切换（无需重启）：
+  #   rosparam set /azj_planner/plan_2d true     # 切 2D
+  #   rosparam set /azj_planner/plan_2d false    # 切 3D
+  # 下一重规划周期生效，并自动重建轨迹。
+  plan_2d: false
+
+  # 2D 模式的 clearance 处理。
+  #
+  # ★ 默认不做投影（slab_half: 0.0）：2D 就是用 z=规划平面 那一层的**真实 3D ESDF**。
+  #
+  #   为什么不做投影（关键设计取舍）：
+  #     柱状投影把 z 方向压扁，会连"垂直方向的空隙"一起压掉。
+  #     典型例子：穿框 —— 框的孔在规划层是空的，投影把框上下沿压到同一平面后
+  #     孔变成实心，"本来有空间却没有空间了"。
+  #     实测：单层能穿过方孔（绕行比 1.00），柱状 ±0.5 直接 NO_PATH。
+  #
+  #   为什么不担心漏掉桌子/横梁：
+  #     飞机严格在规划平面飞行，桌子（z 0~0.5）和横梁（z 1.1~1.5）
+  #     根本撞不到，本就不该参与该层判定。
+  #
+  #   想留一点垂直余量（机体厚度/控制误差）就设 0.05~0.15。
+  #   ⚠ 不要超过 robot_radius：一旦覆盖到地板/天花板，
+  #     每列 clearance 会被压到 ~0，整个平面判死，A* 只能贴残缝绕远
+  #     （实测路径 40m、曲率 66、间隙 7mm）。
+  plan_2d_slab_half: 0.0
+  plan_2d_z_samples: 9
+
+  # ---- 规划层高约束（★ 这个才管规划，virtual_* 只管点云裁剪）----
+  # ⚠ 务必分清：
+  #   rog_map/virtual_ground_height / virtual_ceil_height
+  #       = 点云裁剪边界。**不约束规划**。改它们不会改变路径高度。
+  #   azj/floor_z / azj/ceil_z
+  #       = 规划可通行空间。低于 floor_z 或高于 ceil_z 一律判不可通行。
+  #
+  # 不给这两个值的话，A* 会从地板下面 / 天花板上方抄近路
+  # （那片区域没有点云 → UNKNOWN → 按 unknown_clearance_cap 判成可通行）。
+  enforce_height_limits: true
+
+  # 最低可规划高度 [m]。**给多少，路径就会贴到多少** —— 它是一条硬边界，
+  # 边界下面没有代价可罚，所以路径会毫不犹豫地贴着它走。
+  #
+  # 实测（长墙堵死、唯一"出路"是钻地板）：
+  #   floor_z=-0.20 → 路径 zmin=-0.164  （钻到地板下 16cm）
+  #   floor_z=-0.10 → 路径 zmin=-0.081  （钻 8cm）
+  #   floor_z=-0.02 → NO_PATH           （地板拦住，正确）
+  # ★ 所以要设成**地板高度本身**，不要留负余量。
+  #   raicom 场景地面在 z=0 → 设 0.0。
+  #   如果场景整体抬高（地面在 0.5），这里也要跟着改成 0.5。
+  floor_z: 0.00
+
+  # 最高可规划高度 [m]。同上，路径会贴着它走。
+  # 建议 = 飞行高度 + 0.5 ~ 1.0（留出爬升/绕高的余量），
+  # 但不要超过地图的 virtual_ceil_height（超出部分没地图，会被误判为空旷，
+  # 反而让路径往上飞）。超了会被自动钳制并打 WARN。
+  ceil_z: 1.00
+
+  # 高度保持权重。0 = 关闭（z 方向完全自由，会贴边界走）。
+  # 0.3~1.0 通常够：让路径倾向维持起终点高度，只有需要时才升降。
+  w_height: 0.50
+  height_ref_offset: 0.0    # 参考高度 = 起终点平均高度 + 该偏移
+  height_scale: 1.0         # dz 归一化尺度 [m]
+
+  # ★ 高度豁免带 + 带外强罚（压住"往下钻"的关键）
+  #
+  # 为什么必须有：只靠 w_height 的二次项压不住。
+  # 实测 raicom 场景（飞机 0.52、目标 0.80）：
+  #   clearance 0.3 → 0.5 时，代价因子 2.11 → 1.40，净省 0.71/m
+  #   而高度偏离 0.6m，w_height=0.5 只罚 0.18/m
+  #   → 净省 0.53/m，A* 必然下降到 z=0.04（地面附近是 UNKNOWN，
+  #     被 unknown_clearance_cap 高估成"宽敞"）
+  #
+  # 机制：|z-ref| <= height_band 只受温和的 w_height；
+  #       超出后按 (excess)^2 * w_height_band 强罚。
+  #       excess=0.3m 时罚 20*0.09 = 1.8/m，足以压过 clearance 收益。
+  height_band: 0.30
+  w_height_band: 20.0
+
+  # ★★ 高度硬约束带 [m]：|z - 参考高度| 超过它**直接判不可通行**。
+  #
+  # 为什么软惩罚不够（实测）：
+  #   造"矮墙 z0.6~1.0 挡住目标高度、下方 z<0.6 空旷"的场景，
+  #   A* 宁可从墙下钻（z=0.346，到地面 clearance 0.346，代价因子 1.84），
+  #   也不从侧面绕 —— 因为贴墙时 clearance=0.15，代价因子高达 5.44。
+  #   差距 3.6/m。而 w_height_band=20 在 excess=0.154 时只罚 0.47/m；
+  #   加到 100 也只有 2.37/m，仍不够，再大就压死真实升降需求。
+  #   → 必须硬约束。
+  #
+  # 效果（同一场景）：
+  #   z_band=0   → 路径 z=[0.346,0.835]，23 个点在 z<0.5（往下钻）
+  #   z_band=0.40 → 路径 z=[0.783,0.956]，**0 个点在 z<0.5**，改从侧面绕
+  #
+  # 参考高度 = (起点z + 目标z)/2 + height_ref_offset。
+  # 0 = 关闭（退回纯软约束）。
+  # 给多大：至少要能容纳"从当前高度爬升到目标高度"的一半跨度，
+  # 否则会 NO_PATH。默认 0.40 适配 raicom（飞行 0.5~0.8）。
+  z_band: 0.40
+
+  # ---- 曲线优化（折线 → C2 连续三次 B 样条）----
+  # 关闭后退回"简化+平滑"的折线，只用于对照。
+  curve_enable: true
+  curve_sample_step: 0.05   # 曲线按弧长重采样的点间距 [m]
+
+  # ★ w_mid 是「两侧等距」理念的数学表达：
+  #   通道横截面上 clearance = min(左距,右距)，min 只在两侧相等时取到
+  #   该剖面最大值。所以最大化 mean((ref/c)^α) 会自动把路径推到中轴，
+  #   不需要额外的对称项。又因 min 不可微，两侧不等时梯度只反映较近
+  #   一侧，天然形成"回中"反馈。
+  #   实测（45°通道，半净宽1.0m，起终点各偏0.7m）：
+  #     w_mid=1.0 → 中段横向偏移 0.0002m，两侧距离差 0.0004m
+  curve_w_mid: 1.0
+  # 安全 hinge 权重：c < safe_margin(=robot_radius) 时强罚
+  curve_w_obs: 50.0
+  # 平滑（控制点二阶差分）
+  curve_w_smooth: 1.0
+  # 锚定：防止曲线整体漂移。曾无此项时长度暴涨 46%。
+  curve_w_anchor: 0.5
+  # 长度约束：超过初始长度 2% 才生效，防"为了更宽而绕远"
+  curve_w_len: 0.05
+  # 采样点数 / 迭代次数
+  curve_samples: 140
+  curve_iterations: 60      # 150 → 60：曲线优化占规划耗时 95%，见 CHANGELOG v1.3
+
+  # ---- 输出速度保护（避免重规划瞬间掉高）----
+  # 控制器的 type_mask 未设 IGNORE_VZ（nav_mode=3/NAV_LEVEL 时
+  # position.z 与 velocity.z 同时有效），规划器给的 velocity.z
+  # 会被当作速度前馈叠加。重规划瞬间 vz 阶跃会把飞机"拽一下"。
+  #
+  # ① 硬限幅：|vz| <= max_vel_z_out
+  max_vel_z_out: 0.30
+  # ② 淡入：新轨迹前 vel_blend_time 秒内，参考速度从"生成时的实际速度"
+  #    线性过渡到轨迹速度，消除阶跃。0 = 关闭。
+  vel_blend_time: 0.35
+
+  # ---- 曲线优化：根源性改进（v1.2）----
+  #
+  # ① 控制点间距 [m]。必须 < 障碍特征尺寸。
+  #    柱阵间距 1.2m 时，0.6m 间距会让一个控制点跨过整个转弯
+  #    → B 样条过冲穿进柱子（实测 min_clearance=0）。
+  #    0.30m 保证每个拐弯至少 2 个控制点。
+  curve_control_point_spacing: 0.30
+
+  # ② 安全硬投影（PBD 风格）。软惩罚压不过保形项，必须用位置投影：
+  #    每步梯度后，把穿过障碍的控制点沿 ∇c 直接推开。
+  #    关闭它会退回"软惩罚"，密集场景必然撞。
+  curve_enable_projection: true
+  curve_projection_iters: 2
+  curve_projection_samples: 240
+
+  # ③ 局部居中：用"该横截面能提供的最大间隙"做归一化基准。
+  #    全局 ref=1 时，窄通道里 c=0.4 恒有 penalty 6.25、梯度非零，
+  #    优化器会持续试图把路径推到不存在的更宽处 → 贴着障碍抖。
+  #    用 local_ref 后，c==local_ref 时梯度恰好为 0 → 真正"居中即最优"。
+  curve_enable_local_centering: true
+  curve_local_scan_radius: 2.0
+
+  # 曲线最大允许曲率 [1/m]，超过则退回折线。R = 1/kmax。
+  # 20 → R=0.05m。速度规划会按 max_lat_acc 自动降速
+  # （v = sqrt(max_lat_acc/kmax) = sqrt(1.2/20) = 0.24 m/s），
+  # 所以高曲率本身不等于不安全。
+  # 设太小（如 5 → R=0.2m）会在 raicom 紧缝里频繁退回折线
+  # （实测 kmax≈12.5，"2D 没有曲线优化"就是这个原因）。
+  max_curvature: 20.0
+
+  # ---- 轨迹（时间参数化）----
+  # 这些值直接决定喂给控制器的速度/加速度前馈，必须与机体的实际能力匹配。
+  max_vel: 1.0              # 最大水平速度 [m/s]
+  max_vel_z: 0.6            # 最大垂直速度 [m/s]
+  max_acc: 1.5              # 最大加速度 [m/s^2]
+  max_acc_z: 1.0            # 最大垂直加速度 [m/s^2]
+  max_lat_acc: 1.2          # 最大横向(向心)加速度 [m/s^2]，决定转弯限速
+                            # 注意：调大它会让转弯更快，但也更容易过冲
+
+  # ---- 安全 ----
+  robot_radius: 0.30        # 硬安全半径：clearance 低于它直接拒绝通行
+  escape_radius: 0.60       # 起点逃生区（已贴障碍时允许先飞出来）
+
+  # ---- 居中（核心理念）----
+  # 代价 = 长度 * (1 + w * (ref / clamp(c, ·, cap))^alpha)
+  #
+  # 调参参考（离线实测）：
+  #   长通道 10m：w=0.05 → 横向偏移 0.236m→0.008m，长度 +0.75%
+  #   短缝 1.6m ：w=0.20 → 偏移 0.481m→0.027m，长度 +2.5%
+  # 惩罚沿路径累积，窄而短的通道需要更大的 w。
+  clearance_weight: 0.15    # w：0 = 纯最短（EGO 行为）
+  clearance_ref: 1.0        # ref：归一化基准 [m]
+  clearance_cap: 2.0        # cap：超过此 clearance 不再奖励，防绕远
+  alpha: 2.0                # 居中锐度
+
+  # ---- 搜索范围 ----
+  # A* 搜索框 = 起终点包围盒 + 该外扩 [m]。
+  #
+  # 给足余量：路径常需要绕到起终点包围盒之外（绕过整面墙、从房间另一端过去）。
+  # 太小会 NO_PATH —— 但那是"搜索框不够"而不是"真的没路"。
+  # raicom 是 4x4m 房间，2.5 的外扩 + 起终点跨度 → 覆盖全房间。
+  box_margin_x: 2.5
+  box_margin_y: 2.5
+  # z 方向不用给大：有 z_band 硬约束（默认 0.40）限着，
+  # 给 1.5 会白算几十层空层。0.8 足够容纳 0.4 高度带 + 余量。
+  box_margin_z: 0.8
+  goal_tolerance: 0.30
+  max_expansions: 400000
+
+  # ---- 输出 ----
+  goal_topic: "/move_base_simple/goal"
+  path_topic: "/azj/path"
+  marker_topic: "/azj/path_marker"
+  frame_id: "map"
+
+  # ---- 未知区域策略 ----
+  #
+  # ⚠ 这一项踩过大坑：早期版本把 UNKNOWN 直接当障碍（返回 -1），结果
+  #   雷达装在机体上、看不到自己所在体素 → 那里必然是 UNKNOWN →
+  #   飞机永远报 "start is inside an obstacle"，一次都规划不出来。
+  #
+  # 正确语义：UNKNOWN = "没探测过"，不等于"有障碍"。
+  #   而且空地图/未探测区 ESDF 会返回 0，所以**不能**先算 ESDF 再取 min。
+  #
+  unknown_as_free: false            # true = 未知区直接按 free_clearance_if_unknown 处理
+  free_clearance_if_unknown: 0.5    # 仅当 unknown_as_free=true 时生效
+
+  # 未知区的 clearance 取值（unknown_as_free=false 时用）。
+  #   cap >= robot_radius → 未知区可通行，但代价高（规划器倾向已知区域）
+  #   cap <  robot_radius → 未知区视为不可通行（更保守）
+  # 默认 0.5 > robot_radius 0.3，保证"雷达盲区里的起点"能起步。
+  # ⚠ 不要设得比 robot_radius 大太多：UNKNOWN 若被高估成"比已知区域更宽敞"，
+  #   A* 会主动往没探测过的地方（常见是地面/天花板附近）钻。
+  #   实测 0.5 时路径从 0.52 降到 0.04，就是因为低处 UNKNOWN 被算成 0.5 > 0.3。
+  #   取 robot_radius 附近即可：既能起步，又不鼓励探索未探测区。
+  unknown_clearance_cap: 0.32

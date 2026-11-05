@@ -1,0 +1,10 @@
+<launch>
+  <!-- Azj Planner：安全优先的局部规划器
+       只发布路径，不直接发控制指令（不碰解锁/起飞）。 -->
+  <arg name="config_file" default="$(find azj_planner)/config/azj_planner.yaml" />
+
+  <node pkg="azj_planner" type="azj_planner_node" name="azj_planner" output="screen">
+    <param name="config_file" value="$(arg config_file)" />
+    <rosparam command="load" file="$(arg config_file)" />
+  </node>
+</launch>
