@@ -257,6 +257,10 @@ private:
         // 所以仿真里必须设成 fly_height。
         double goal_z_override{NAN};
         double arrive_tol{0.25};       // 判定到达的距离
+        // 判定到达的速度上限 [m/s]。只看距离会导致“带着速度判到位”，
+        // 规划器停止输出轨迹后 PX4 位置环刹不住 → 冲过目标 0.15~0.25m。
+        // 实测轨迹末端的自然末速很小，0.20 不会拖延到达。
+        double arrive_vel_tol{0.20};
         // ---- 2D / 3D 模式 ----
         // true  = 只在 XY 平面规划（高度锁在目标高度）
         // false = 完整 3D
@@ -289,6 +293,14 @@ private:
         // 实测一次完整规划 1.5~1.7s，所以这个值不会拖慢正常重规划；
         // 它只防止“规划→被拒→重规划”循环把主线程跑满。
         double min_replan_period{0.30};
+        // 安全触发（BLOCKED）时的退避上限 [s]。只用于防同一帧重复进入，
+        // **不是安全延迟**：新障碍侵入轨迹时必须尽快重规划。
+        // 实测一次规划 0.33~1.31s，所以这 0.1s 在总延迟里占比很小，
+        // 但原来 0.3s 的退避会让总延迟再叠加 0.3s。
+        double blocked_replan_period{0.10};
+        // 安全触发的重规划是否走“快通道”（跳过曲线优化）。
+        // 曲线优化占单次规划耗时 95%+，紧急时用它换平滑度不划算。
+        bool blocked_fast_path{true};
     };
 
     /// 参数来源三级：yaml 的 azj 段打底 → 参数服务器覆盖 → 代码默认值。
@@ -341,10 +353,13 @@ private:
                 dbl("yaw_rate_max", np_.yaw_rate_max);
                 dbl("goal_z_override", np_.goal_z_override);
                 dbl("arrive_tol", np_.arrive_tol);
+                dbl("arrive_vel_tol", np_.arrive_vel_tol);
                 dbl("replan_lead", np_.replan_lead);
                 dbl("replan_deviation", np_.replan_deviation);
                 dbl("safety_lookahead", np_.safety_lookahead);
                 dbl("min_replan_period", np_.min_replan_period);
+                dbl("blocked_replan_period", np_.blocked_replan_period);
+                bln("blocked_fast_path", np_.blocked_fast_path);
 
                 dbl("resolution", sp_.resolution);
                 dbl("robot_radius", sp_.robot_radius);
@@ -427,11 +442,17 @@ private:
         pnh_.param("azj/yaw_rate_max", np_.yaw_rate_max, np_.yaw_rate_max);
         pnh_.param("azj/goal_z_override", np_.goal_z_override, np_.goal_z_override);
         pnh_.param("azj/arrive_tol", np_.arrive_tol, np_.arrive_tol);
+        pnh_.param("azj/arrive_vel_tol", np_.arrive_vel_tol,
+                   np_.arrive_vel_tol);
         pnh_.param("azj/replan_lead", np_.replan_lead, np_.replan_lead);
         pnh_.param("azj/replan_deviation", np_.replan_deviation, np_.replan_deviation);
         pnh_.param("azj/safety_lookahead", np_.safety_lookahead, np_.safety_lookahead);
         pnh_.param("azj/min_replan_period", np_.min_replan_period,
                    np_.min_replan_period);
+        pnh_.param("azj/blocked_replan_period", np_.blocked_replan_period,
+                   np_.blocked_replan_period);
+        pnh_.param("azj/blocked_fast_path", np_.blocked_fast_path,
+                   np_.blocked_fast_path);
 
         pnh_.param("azj/resolution", sp_.resolution, sp_.resolution);
         pnh_.param("azj/robot_radius", sp_.robot_radius, sp_.robot_radius);
@@ -1013,18 +1034,27 @@ private:
     /// 于是参考点永远停在"新轨迹的前 0.2s"，而轨迹前段速度又受 v_start 限制，
     /// 一旦速度反馈滞后，参考速度就永远上不去（实测 max|v| 卡在 0.03 m/s）。
     /// 正确做法是让每条轨迹**完整执行**，只在必要时重建。
-    bool needReplan(const Eigen::Vector3d& start) {
-        if (!has_trajectory_ || !traj_.valid()) return true;
+    /// 重规划原因。区分原因是为了让**安全触发的重规划能绕过退避**（见 v1.3.2）。
+    enum class ReplanReason {
+        NONE,
+        NO_TRAJ,      // 没有可用轨迹
+        TRAJ_END,     // 轨迹快走完（常规重规划，可以退避）
+        DEVIATED,     // 跟丢了参考点
+        BLOCKED       // ★ 前方参考点被新障碍侵入 —— 安全触发，不可退避
+    };
+
+    ReplanReason needReplan(const Eigen::Vector3d& start) {
+        if (!has_trajectory_ || !traj_.valid()) return ReplanReason::NO_TRAJ;
 
         const double t = (ros::Time::now() - traj_start_).toSec();
         // (a) 轨迹快走完
-        if (t >= traj_.duration() - np_.replan_lead) return true;
+        if (t >= traj_.duration() - np_.replan_lead) return ReplanReason::TRAJ_END;
 
         // (b) 跟丢了：实际位置离参考点太远
         if ((start - last_ref_pos_).norm() > np_.replan_deviation) {
             ROS_WARN_STREAM_THROTTLE(1.0, "[azj] deviated from reference by "
                                               << (start - last_ref_pos_).norm() << "m, replanning");
-            return true;
+            return ReplanReason::DEVIATED;
         }
 
         // (c) 安全监控：前方参考点被新障碍侵入 → 必须重规划
@@ -1058,10 +1088,10 @@ private:
                                                   << c << "m < robot_radius="
                                                   << sp_.robot_radius
                                                   << "m), replanning");
-                return true;
+                return ReplanReason::BLOCKED;
             }
         }
-        return false;
+        return ReplanReason::NONE;
     }
 
     void replanCallback(const ros::TimerEvent&) {
@@ -1166,12 +1196,32 @@ private:
         }
 
         if ((start - goal).norm() <= np_.arrive_tol) {
-            if (!arrived_) {
+            // ★ 到达判定必须同时看速度（2026-11-05，治“到点过冲”）。
+            //
+            // 只看距离的后果（实测）：飞机进 0.15m 球时速度还有 0.41 m/s，
+            // 规划器立刻发 COMPLETED、停止输出轨迹 → 只剩 PX4 位置环刹车，
+            // 但 PX4 位置环的增益不足以在 0.15m 内刹住 0.4m/s，
+            // 于是冲过目标 0.15~0.25m，再被拉回来。
+            // 用户看到的就是“到点过冲”。
+            //
+            // 正确语义：到点 = 到达且停下。速度未降时**继续输出轨迹**
+            // （轨迹本身已经在减速，因为 goal 就在眼前），让它自己刹住。
+            //
+            // arrive_vel_tol 取 0.20 m/s：实测轨迹末端的自然末速就很小，
+            // 这个阀值不会拖延到达，只是拒绝“带着明显速度”就判到位。
+            const bool slow_enough = current_vel_.head<2>().norm() <= np_.arrive_vel_tol;
+            if (!slow_enough) {
+                // 速度还大：不判到达，继续规划/跟轨迹
+                // （不 return，让下面的 needReplan 正常走）
+            } else if (!arrived_) {
                 arrived_ = true;
                 has_trajectory_ = false;
-                ROS_INFO("[azj] goal reached (dist=%.3f)", (start - goal).norm());
+                ROS_INFO("[azj] goal reached (dist=%.3f, |v|=%.2f)",
+                         (start - goal).norm(), current_vel_.head<2>().norm());
+                return;
+            } else {
+                return;
             }
-            return;
         }
 
         // ---------- 2D / 3D 模式（支持运行时切换）----------
@@ -1192,20 +1242,39 @@ private:
         plan_2d_z_active_ = goal.z();
         z_plane_ = plan_2d_z_active_;
 
-        if (!needReplan(start)) return;
+        const ReplanReason why = needReplan(start);
+        if (why == ReplanReason::NONE) return;
 
-        // ★ 重规划频率硬上限（2026-11-05）。
+        // ★ 重规划退避（2026-11-05 引入，2026-11-05 v1.3.2 修正）。
         //
-        // 机制保证而非依赖上面的逻辑正确：即使将来又出现“规划→被拒→重规划”
-        // 这类活锁，也绝不会把主线程跑成 100% CPU、导致 /planning/pos_cmd 断流。
-        // 实测一次完整规划（A* + 曲线，含安全重试）约 1.5~1.7s，
-        // 所以 0.30s 的下限不会拖慢正常重规划，只在异常时兑底。
+        // 退避的目的只有一个：防止“规划→被拒→重规划”活锁把主线程跑满。
+        // 它**绝不能**拦安全触发的重规划 —— 那是把防活锁机制变成了安全隐患。
+        //
+        // 实测问题（用户报“墙刚被扫出来但路径不避开”）：
+        //   雷达扫出新墙 → needReplan 报 BLOCKED → 但正好落在 0.3s 退避窗口内
+        //   → return，继续沿**旧轨迹飞向那面墙** → 再叠加 0.33~1.31s 的规划耗时，
+        //   总延迟可达 1.6s（1m/s 下飞 1.6m）→ 穿墙。
+        //
+        // 现在按原因分级：
+        //   BLOCKED  → 退避上限压到 blocked_replan_period（默认 0.10s，
+        //              只用于防止同一帧内重复进入，不再是安全延迟）
+        //   其他原因 → 用 min_replan_period（防活锁的本来用途）
         {
             const ros::WallTime now = ros::WallTime::now();
+            const double limit = (why == ReplanReason::BLOCKED)
+                                     ? np_.blocked_replan_period
+                                     : np_.min_replan_period;
             if (!last_replan_wall_.isZero()) {
                 const double dt = (now - last_replan_wall_).toSec();
-                if (dt < np_.min_replan_period) {
-                    return;   // 退避：上一条轨迹还在，控制器自己接着飞
+                if (dt < limit) {
+                    if (why == ReplanReason::BLOCKED) {
+                        // 安全触发被退避：明确打日志，便于现场判断“是不是这里慢了”
+                        ROS_WARN_STREAM_THROTTLE(
+                            0.5, "[azj] BLOCKED but throttled by replan period (dt="
+                                     << dt << "s < " << limit
+                                     << "s) - still flying old trajectory!");
+                    }
+                    return;
                 }
             }
             last_replan_wall_ = now;
@@ -1275,7 +1344,25 @@ private:
         // 实测转角中位 45°、最大 92°，且加大平滑迭代无效（因为顶点间仍是直线）。
         // 现在改用 ESDF 梯度驱动的三次 B 样条优化，得到 C2 连续曲线。
         std::vector<Eigen::Vector3d> path = simplifyPath(res.path);
-        if (np_.curve_enable) {
+
+        // ★ 安全快通道（v1.3.2）：新障碍侵入轨迹时跳过曲线优化。
+        //
+        // 实测耗时对比（同一场景）：
+        //     A*          13 ~ 25 ms
+        //     曲线优化    327 ~ 1308 ms     ← 40~80 倍
+        //
+        // 用户现场问题：“雷达下一帧扫出来了，路径还是没及时避开”。
+        // 延迟链路：退避 0.3s + 规划 1.3s ≈ 1.6s（1m/s 下飞 1.6m）→ 穿墙。
+        //
+        // 而本项目**只有单线程 spinner**（ros::spin()），规划在 replanCallback 里
+        // 同步执行，期间 pos_cmd 断流、点云回调也停摆（实测断流 >1s 有 17 次）。
+        // 所以缩短这段同步时间本身就是安全收益。
+        //
+        // 取舍：急时就别管平滑了。折线转角大（实测中位 45°），但**不撞**优先。
+        // 这条快路径跑完后，下一次常规重规划（TRAJ_END）会出完整曲线替换它。
+        // 可用 `azj/blocked_fast_path: false` 关掉，退回旧行为。
+        const bool fast_path = np_.blocked_fast_path && (why == ReplanReason::BLOCKED);
+        if (np_.curve_enable && !fast_path) {
             cp_.safe_margin = sp_.robot_radius;
             cp_.clearance_ref = sp_.clearance_ref;
             cp_.clearance_cap = sp_.clearance_cap;
@@ -1421,6 +1508,11 @@ private:
             }
         } else {
             path = smoothPath(path, field, sp_.robot_radius, 3, 0.35);
+            if (fast_path) {
+                ROS_WARN_THROTTLE(
+                    0.5, "[azj] BLOCKED -> fast path (skip curve opt, ~30ms instead of ~1.3s); "
+                         "next replan will smooth it");
+            }
         }
 
         const double min_c = minClearanceAlongPath(path, field, 0.02);
