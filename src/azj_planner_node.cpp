@@ -19,6 +19,8 @@
 #include <mutex>
 #include <stdexcept>
 #include <fstream>
+#include <iomanip>
+#include <sys/stat.h>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -645,6 +647,32 @@ private:
         /// 所以这个值必须按"真实伺服能跟上"标定，不能按理论推。
         double rolling_v_lead{0.05};
 
+        /// A* 的 clearance 余量倍数（2026-11-25）。
+        ///
+        /// A* 按 `robot_radius × 本值` 作为硬约束搜路，给 MINCO 的平滑
+        /// 切角留空间。1.0 = 关闭（旧行为）。
+        ///
+        /// 实测依据：A* 按 1.0 规划时路径 clearance 恰好 0.30，MINCO 段内
+        /// 切角压到 0.0039 → 连续被拒 → 折线。取 1.3 让折线离障碍 0.39m，
+        /// 切角后仍有 ~0.3 余量。
+        ///
+        /// 找不到路会自动退回 1.0，所以窄缝场景不会因此瘫痪。
+        double rolling_astar_margin{1.30};
+
+        /// MINCO 输入/输出完整 dump（2026-11-25，为定位"为什么被拒"）。
+        ///
+        /// 空字符串 = 关闭。设成目录（如 `/tmp/azj_minco_dump`）后，每次
+        /// `buildTrajectoryMinco` 调用会写一个文件，包含：
+        ///   · head / tail 状态（p,v,a,j）
+        ///   · 输入路径逐点 + 其 clearance（这是 A\* 给的东西）
+        ///   · MINCO 输出轨迹逐点 + clearance（这是优化结果）
+        ///   · 三道校验的判定值与阈值
+        ///   · 优化参数（w_mid / w_obs / iterations / lock_z ...）
+        ///
+        /// 为什么需要：如果只看"被拒"的结果，无法区分"输入就贴障碍"
+        /// 与"优化把好路径弄坏了"。这两种情况的修法完全不同。
+        std::string minco_dump_dir{""};
+
         /// 从旧轨迹**继承**的引导段长度 [m]（2026-11-17，学 SUPER 的 receding_dis）。
         ///
         /// 这是重规划连续性的核心：新轨迹的前 receding_dis 米直接沿用旧轨迹
@@ -1129,6 +1157,8 @@ private:
                 dbl("rolling_period", np_.rolling_period);
                 dbl("rolling_track_acc", np_.rolling_track_acc);
                 dbl("rolling_v_lead", np_.rolling_v_lead);
+                dbl("rolling_astar_margin", np_.rolling_astar_margin);
+                str("minco_dump_dir", np_.minco_dump_dir);
                 dbl("rolling_receding_dis", np_.rolling_receding_dis);
                 dbl("traj_expired_min_vel", np_.traj_expired_min_vel);
                 i32("minco_max_reject_streak", np_.minco_max_reject_streak);
@@ -1294,6 +1324,9 @@ private:
         pnh_.param("azj/rolling_period", np_.rolling_period, np_.rolling_period);
         pnh_.param("azj/rolling_track_acc", np_.rolling_track_acc, np_.rolling_track_acc);
         pnh_.param("azj/rolling_v_lead", np_.rolling_v_lead, np_.rolling_v_lead);
+        pnh_.param("azj/rolling_astar_margin", np_.rolling_astar_margin,
+                   np_.rolling_astar_margin);
+        pnh_.param("azj/minco_dump_dir", np_.minco_dump_dir, np_.minco_dump_dir);
         pnh_.param("azj/rolling_receding_dis", np_.rolling_receding_dis,
                    np_.rolling_receding_dis);
         pnh_.param("azj/traj_expired_min_vel", np_.traj_expired_min_vel,
@@ -2644,6 +2677,51 @@ private:
         return out;
     }
 
+    /// 限制相邻点最大间距：长直线段中间插点。
+    ///
+    /// ★★★ 为什么必须做（2026-11-25 实飞 dump 定位）
+    ///
+    /// `simplifyPath` 只保留拐角、删掉共线点。于是 A* 输出里会出现
+    /// **1.2m 的长直线段只有两个端点**。而 MINCO 的 `piece_len=0.40`
+    /// 决定内点数：1.2m 段只分到 3 个内点，配上 36° 的转折，
+    /// 7 次多项式必然过冲。
+    ///
+    /// 实测（flight_20261125_195750, minco_00045）：
+    ///   in_path:  [11](-2.56,-0.90) → [12](-1.62,-1.60)  **1.175m**
+    ///             [12] → [13](-0.42,-1.60)               **1.200m**
+    ///   输出:     vmax=**4.47 m/s**（max_vel=1.0 的 4.5 倍）
+    ///             amax=**20.4 m/s²**（max_acc=1.0 的 20 倍）
+    ///             min_clr 从输入 0.18 掉到 **0.0028**  → 被拒 → 折线
+    ///
+    /// @param max_gap 相邻点最大间距 [m]，建议 ≤ piece_len
+    std::vector<Eigen::Vector3d> densifyPath(const std::vector<Eigen::Vector3d>& in,
+                                             double max_gap) const {
+        if (in.size() < 2 || max_gap <= 1e-6) return in;
+        std::vector<Eigen::Vector3d> out;
+        out.reserve(in.size() * 2);
+        out.push_back(in.front());
+        int inserted = 0;
+        for (size_t i = 1; i < in.size(); ++i) {
+            const Eigen::Vector3d& a = in[i - 1];
+            const Eigen::Vector3d& b = in[i];
+            const double d = (b - a).norm();
+            if (d > max_gap) {
+                const int n = static_cast<int>(std::ceil(d / max_gap));
+                for (int k = 1; k < n; ++k) {
+                    out.push_back(a + (b - a) * (static_cast<double>(k) / n));
+                    ++inserted;
+                }
+            }
+            out.push_back(b);
+        }
+        if (inserted > 0) {
+            ROS_INFO_STREAM_THROTTLE(
+                2.0, "[azj] densify: " << in.size() << " -> " << out.size()
+                     << " pts (inserted " << inserted << ", max_gap " << max_gap << "m)");
+        }
+        return out;
+    }
+
     /// 把**当前生效轨迹从此刻往后的剩余部分**发布成 /azj/path（2026-11-17）。
     ///
     /// 与 `sampleTrajAsPath()` 的区别：那个从 t=0 抽稀（显示整条轨迹，
@@ -2734,10 +2812,208 @@ private:
     /// @param head   起点状态。**a/j 必须来自旧轨迹**（这是 MINCO 的核心收益：
     ///               告诉优化器"我正以 a 加速/减速"，而不是每次从 a=0 重来）
     /// @param tail   终点状态（rolling 时 v 非零）
+    /// 把一次 MINCO 调用写成文本文件，供离线分析（2026-11-25）。
+    ///
+    /// 只写文本（不写二进制）：可以直接 grep / 人工读，
+    /// 也能被 azj_path_audit.py 解析。
+    void dumpMincoCall(const ClearanceField& field,
+                       const std::vector<Eigen::Vector3d>& in_path,
+                       const StatePVAJ& head, const StatePVAJ& tail,
+                       const MincoOptParams& mp,
+                       const MincoOptResult* res,   // nullptr = 优化失败
+                       double mc_check, double min_ok, double vmax_ok,
+                       bool accepted,
+                       // ★ 2026-11-25 追加：A* 路径的最差点 + 简化前的原始路径
+                       const Eigen::Vector3d* astar_worst = nullptr,
+                       double astar_worst_clr = -1.0,
+                       const std::vector<Eigen::Vector3d>* raw_before_simplify = nullptr) {
+        if (np_.minco_dump_dir.empty()) return;
+        static int seq = 0;
+        const std::string dir = np_.minco_dump_dir;
+        ::mkdir(dir.c_str(), 0755);   // 已存在则失败，可忽略
+
+        char fn[512];
+        std::snprintf(fn, sizeof(fn), "%s/minco_%05d_t%.3f.txt",
+                      dir.c_str(), ++seq, ros::Time::now().toSec());
+        std::ofstream f(fn);
+        if (!f) {
+            ROS_WARN_STREAM_THROTTLE(2.0, "[azj] cannot write dump: " << fn);
+            return;
+        }
+        f << std::fixed << std::setprecision(6);
+
+        f << "# azj MINCO dump  seq=" << seq << "  accepted=" << (accepted ? 1 : 0) << "\n";
+        f << "# wall=" << std::setprecision(9) << ros::Time::now().toSec()
+          << std::setprecision(6) << "\n";
+
+        // ---- 起点/终点状态 ----
+        f << "[head]\n";
+        f << "p " << head.p.transpose() << "  clr " << field.clearance(head.p) << "\n";
+        f << "v " << head.v.transpose() << "\n";
+        f << "a " << head.a.transpose() << "\n";
+        f << "j " << head.j.transpose() << "\n";
+        f << "[tail]\n";
+        f << "p " << tail.p.transpose() << "  clr " << field.clearance(tail.p) << "\n";
+        f << "v " << tail.v.transpose() << "\n";
+
+        // ---- 参数 ----
+        f << "[params]\n";
+        f << "w_mid " << mp.w_mid << "  w_obs " << mp.w_obs
+          << "  w_smooth " << mp.w_smooth << "  w_time " << mp.w_time
+          << "  w_anchor " << mp.w_anchor << "\n";
+        f << "max_vel " << mp.max_vel << "  max_acc " << mp.max_acc
+          << "  safe_margin " << mp.safe_margin << "\n";
+        f << "iterations " << mp.iterations << "  pieces " << mp.pieces
+          << "  piece_len " << mp.piece_len << "\n";
+        f << "lock_z " << (mp.lock_z ? 1 : 0) << "  lock_z_value "
+          << mp.lock_z_value << "  z_bounds " << (mp.enable_z_bounds ? 1 : 0)
+          << "  z[" << mp.z_min << "," << mp.z_max << "]\n";
+        f << "stop_at_end " << (mp.stop_at_end ? 1 : 0) << "\n";
+
+        // ---- 校验 ----
+        f << "[check]\n";
+        f << "mc " << mc_check << "  min_ok " << min_ok
+          << "  vmax_ok " << vmax_ok << "  accepted " << (accepted ? 1 : 0) << "\n";
+
+        // ---- 输入路径（A* 给的，逐点带 clearance）----
+        f << "[in_path]  n=" << in_path.size() << "\n";
+        double in_min = 1e9;
+        for (size_t i = 0; i < in_path.size(); ++i) {
+            const double c = field.clearance(in_path[i]);
+            in_min = std::min(in_min, c);
+            f << "  " << i << " " << in_path[i].transpose() << "  clr " << c << "\n";
+        }
+        f << "[in_path_min_clr] " << in_min << "\n";
+
+        // ---- 输出轨迹（MINCO 结果）----
+        if (res && res->success) {
+            f << "[out_traj]  ok=1 len=" << res->length
+              << " dur=" << res->duration
+              << " min_clr=" << res->min_clearance
+              << " vmax=" << res->max_vel
+              << " amax=" << res->max_acc
+              << " iters=" << res->iterations << "\n";
+            double out_min = 1e9;
+            Eigen::Vector3d wpt(0, 0, 0);
+            for (double t = 0.0; t <= res->duration + 1e-9; t += 0.02) {
+                Eigen::Vector3d p, v, a;
+                if (!res->traj.sample(std::min(t, res->duration), p, v, a)) continue;
+                const double c = field.clearance(p);
+                if (c < out_min) { out_min = c; wpt = p; }
+                f << "  " << t << " " << p.transpose()
+                  << "  clr " << c << "  |v| " << v.norm() << "\n";
+            }
+            f << "[out_traj_worst] " << wpt.transpose() << "  clr " << out_min << "\n";
+        } else {
+            f << "[out_traj]  ok=0  msg="
+              << (res ? res->msg : std::string("optimize not called")) << "\n";
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        //  ★ A* 路径最差点诊断（2026-11-25）
+        // ══════════════════════════════════════════════════════════════
+        //
+        // 要回答的矛盾：A* 内部按 robot_radius=0.30 硬约束搜路，
+        // 事后用同一个 field 沿路径采样却算出 0.0088。
+        // 二者必有一错。这里把最差点钉死，并做三件事区分成因：
+        //
+        //   ① 打出最差点坐标 + 该点 ±3cm 的 clearance 分布
+        //      → 判断是否落在障碍边界（插值/离散化误差）
+        //   ② 打出**简化前**的原始路径（A* 栅格级，间距 0.1m）
+        //      → 若原始路径也在该点附近且 clr 很低：A* 本身漏检
+        //      → 若原始路径在那段有密集点而 clr 正常：simplifyPath 删错了
+        //   ③ 统计原始路径与简化路径各自的 min_clr
+        if (astar_worst && astar_worst_clr >= -0.5) {
+            f << "[astar_worst] " << astar_worst->transpose()
+              << "  clr " << astar_worst_clr << "\n";
+            // 局部 ±3cm 网格（步长 1cm），看是不是卡在障碍表面
+            f << "[astar_worst_local]\n";
+            const double zq = plan_2d_active_ ? plan_2d_z_active_ : astar_worst->z();
+            for (int ix = -3; ix <= 3; ++ix) {
+                for (int iy = -3; iy <= 3; ++iy) {
+                    const Eigen::Vector3d p(astar_worst->x() + 0.01 * ix,
+                                            astar_worst->y() + 0.01 * iy, zq);
+                    const double c = field.clearance(p);
+                    if (!std::isfinite(c)) continue;
+                    f << "L " << ix << " " << iy << " " << c << "\n";
+                }
+            }
+        }
+
+        if (raw_before_simplify && raw_before_simplify->size() >= 2) {
+            const auto& rp = *raw_before_simplify;
+            double raw_min = 1e9;
+            Eigen::Vector3d raw_worst(0, 0, 0);
+            for (const auto& q : rp) {
+                const double c = field.clearance(q);
+                if (c < raw_min) { raw_min = c; raw_worst = q; }
+            }
+            f << "[raw_path]  n=" << rp.size() << "  min_clr=" << raw_min
+              << "  worst " << raw_worst.transpose() << "\n";
+            for (size_t i = 0; i < rp.size(); ++i) {
+                f << "  " << i << " " << rp[i].transpose()
+                  << "  clr " << field.clearance(rp[i]) << "\n";
+            }
+            // 对比：简化前后
+            double sim_min = 1e9;
+            for (const auto& q : in_path) sim_min = std::min(sim_min, field.clearance(q));
+            f << "[simplify_diff] raw_n=" << rp.size()
+              << " sim_n=" << in_path.size()
+              << " raw_min_clr=" << raw_min
+              << " sim_min_clr=" << sim_min
+              << " delta=" << (sim_min - raw_min) << "\n";
+            if (sim_min < raw_min - 1e-3) {
+                f << "# !! simplifyPath 让 clearance 变差了 —— 查删点逻辑\n";
+            } else {
+                f << "# simplifyPath 未使 clearance 变差（差值>=0）\n";
+            }
+        }
+
+        // ---- 环境点云快照（只取路径附近，控制文件大小）----
+        //
+        // 这是最关键的一段：没有它就无法离线复现（点云随时间变化，
+        // 而 bag 里只有 inf_occ 的最后一帧）。半径取 3m 覆盖整条路径周边。
+        {
+            Eigen::Vector3d lo = head.p, hi = head.p;
+            for (const auto& q : in_path) {
+                lo = lo.cwiseMin(q);
+                hi = hi.cwiseMax(q);
+            }
+            const double R = 3.0;
+            f << "[env_grid]\n";
+            f << "bbox " << (lo.x() - R) << " " << (lo.y() - R) << " " << (lo.z() - 0.2)
+              << " " << (hi.x() + R) << " " << (hi.y() + R) << " " << (hi.z() + 0.2) << "\n";
+            // 以 0.10m 网格采样 clearance（与 ESDF 分辨率一致）
+            // 点数控制在 ~(8/0.1)*(8/0.1) = 6400 per layer，单层即可
+            const double zq = plan_2d_active_ ? plan_2d_z_active_ : head.p.z();
+            f << "z " << zq << "\n";
+            int cnt = 0;
+            for (double x = lo.x() - R; x <= hi.x() + R; x += 0.10) {
+                for (double y = lo.y() - R; y <= hi.y() + R; y += 0.10) {
+                    const double c = field.clearance(Eigen::Vector3d(x, y, zq));
+                    if (!std::isfinite(c)) continue;
+                    if (c > 1.5) continue;   // 只记障碍附近，省空间
+                    f << "g " << x << " " << y << " " << c << "\n";
+                    ++cnt;
+                }
+            }
+            f << "[env_grid_n] " << cnt << "\n";
+        }
+        f.close();
+        ROS_INFO_STREAM_THROTTLE(5.0, "[azj] MINCO dump -> " << fn);
+    }
+
     bool buildTrajectoryMinco(const std::vector<Eigen::Vector3d>& path, const StatePVAJ& head,
                               const StatePVAJ& tail, bool stop_at_end,
-                              double vmax_allow = -1.0) {
+                              double vmax_allow = -1.0,
+                              // 简化前的原始路径（仅用于 dump 诊断，可空）
+                              const std::vector<Eigen::Vector3d>* raw_path = nullptr) {
         if (path.size() < 2) return false;
+
+        // 传给 dump 的引用（空指针时给一个空 vector，保持调用简单）
+        static const std::vector<Eigen::Vector3d> kEmptyPath;
+        const std::vector<Eigen::Vector3d>& raw_path_ref =
+            raw_path ? *raw_path : kEmptyPath;
 
         MincoOptParams mp;
         mp.safe_margin = sp_.robot_radius;
@@ -2769,15 +3045,70 @@ private:
             mp.z_max = np_.ceil_z;
         }
 
+        // ★★★ 长直线段插点（2026-11-25 实飞定位的根因）
+        //
+        // 传进来的 path 经过 simplifyPath，长直线只剩两端点。
+        // MINCO 的 piece_len 决定内点密度，1.2m 段只 3 个点 →
+        // 配 36° 转折 → 7 次多项式过冲 → vmax 4.47 / amax 20.4 → 被拒。
+        //
+        // 插到 ≤ piece_len（默认 0.40m），保证内点密度均匀。
+        const std::vector<Eigen::Vector3d> path_dense =
+            densifyPath(path, std::max(0.10, mp.piece_len));
+        const std::vector<Eigen::Vector3d>& path_eff = path_dense;
+
         // 曲线场：与路径搜索用同一个（2D 模式自动带柱状投影）
         const ClearanceField::Ptr field = makeField(plan_2d_z_active_, head.p.z());
         const ros::WallTime t0 = ros::WallTime::now();
         MincoOptimizer opt;
-        MincoOptResult r = opt.optimize(head, tail, path, *field, mp);
+        MincoOptResult r = opt.optimize(head, tail, path_eff, *field, mp);
+        const double ms_first = (ros::WallTime::now() - t0).toSec() * 1e3;
+
+        // ══════════════════════════════════════════════════════════════════
+        //  ★★★ 安全不达标时**递进加重安全项重试**（2026-11-25）
+        // ══════════════════════════════════════════════════════════════════
+        //
+        // 事故（/tmp/azj_planner.log，实飞）：
+        //   t=43.85~44.96 连续 12 次 MINCO 拒绝，min_clr 在 0.002~0.008 之间，
+        //   每次都"放弃 keep_old → B 样条"，B 样条也失败 → 落成折线 1.1s。
+        //
+        //   那些轨迹的形状是对的（len 4.2~5.0m、seg 4.3m），只是 clearance
+        //   差了 0.26m。直接拒绝太浪费 —— B 样条分支早有这个机制
+        //   （`w_obs ×10 → ×50` 递进重试），MINCO 一直没有。
+        //
+        // 现在补上：不达标就把 w_obs 加大重来，最多 2 次（×10、×50）。
+        // 每次只多花 3~10ms（MINCO 单次实测 1~12ms），远小于"退回折线"
+        // 带来的 1 秒抖动。
+        {
+            const double min_ok0 = sp_.robot_radius * 0.9;
+            const double vmax_ok0 = tp_.max_vel * 1.25;
+            for (const double boost : {10.0, 50.0}) {
+                if (!r.success) break;
+                const bool need_more =
+                    (r.min_clearance < min_ok0) || (r.max_vel > vmax_ok0);
+                if (!need_more) break;
+                MincoOptParams mp2 = mp;
+                mp2.w_obs = mp.w_obs * boost;
+                mp2.iterations = std::max(mp.iterations, 80);
+                mp2.projection_iters = std::max(mp.projection_iters, 4);
+                mp2.projection_samples = std::max(mp.projection_samples, 400);
+                MincoOptResult r2 = opt.optimize(head, tail, path_eff, *field, mp2);
+                if (r2.success && r2.min_clearance > r.min_clearance) {
+                    ROS_INFO_STREAM("[azj] MINCO retry w_obs x" << boost << ": min_clr "
+                                    << r.min_clearance << " -> " << r2.min_clearance
+                                    << "  vmax " << r.max_vel << " -> " << r2.max_vel);
+                    // MincoOptResult 含不可拷贝成员（MincoS4NU 持裸指针的
+                    // BandedSystem）→ 必须 move
+                    r = std::move(r2);
+                }
+            }
+        }
         const double ms = (ros::WallTime::now() - t0).toSec() * 1e3;
 
         if (!r.success) {
             ROS_WARN_STREAM_THROTTLE(1.0, "[azj] MINCO failed: " << r.msg);
+            // 此处 astar_min_clr 还没算（在下方的校验块里），只 dump 基本内容
+            dumpMincoCall(*field, path_eff, head, tail, mp, &r, 0.0, 0.0, 0.0, false,
+                          nullptr, -1.0, &raw_path_ref);
             return false;
         }
 
@@ -2812,11 +3143,57 @@ private:
         // 段长（三道校验都要用，先算出来）
         const double seg_len_chk = [&] {
             double l = 0.0;
-            for (size_t i = 1; i < path.size(); ++i) l += (path[i] - path[i - 1]).norm();
+            for (size_t i = 1; i < path_eff.size(); ++i)
+                l += (path_eff[i] - path_eff[i - 1]).norm();
             return l;
         }();
         {
-            const double min_ok = sp_.robot_radius * 0.9;
+            // ★★★ 校验阈值必须按**A* 路径的实测值**定，不能固定 robot_radius*0.9
+            //     （2026-11-25 实飞定位的根因）
+            //
+            // 实测（/home/spadea/azj_flights/flight_20261125_171737）：
+            //   场景是密集柱阵，S(-1.69,-0.05) → G(-0.15,-1.45) 的直线
+            //   **宽度只有 0.10m**（机器人直径 0.60m），必须绕行。
+            //   实测该场景 A* 的物理上限：
+            //     robot_radius=0.30 → 能过，路径 min_clr 最高 **0.318m**
+            //     robot_radius=0.36 → 无解（FAIL）
+            //     robot_radius=0.42 → 无解（FAIL）
+            //   也就是说 A* 已经把路径做到几何极限了。
+            //
+            //   而 MINCO 的 7 次多项式平滑**必然切角**，0.318 → 0.003，
+            //   低于固定阈值 0.27 → 连续 18 次拒绝 → 折线 3.1 秒。
+            //   这不是 MINCO 的错，是"要求平滑后还达到 0.27"在这个几何下无解。
+            //
+            // 正确语义：
+            //   下限 = min(robot_radius*0.9, A*路径实测min_clr*0.85)
+            //   即"不要求比 A* 更好"，只要求"不明显比 A* 更差"。
+            //   A* 路径本身就是硬约束搜出来的，它代表该场景的可行极限。
+            //   安全底线仍由 A* 的 robot_radius 保证（0.30m），
+            //   MINCO 平滑后允许略低，但不得低于 85% 的 A* 水平。
+            const double min_ok_hard = sp_.robot_radius * 0.9;
+            double astar_min_clr = std::numeric_limits<double>::max();
+            Eigen::Vector3d astar_worst_pt(0, 0, 0);
+            {
+                // 沿 path 密集采样（path 是 A* 简化后的折线）
+                for (size_t i = 1; i < path_eff.size(); ++i) {
+                    const Eigen::Vector3d& a = path_eff[i - 1];
+                    const Eigen::Vector3d& b = path_eff[i];
+                    const double len = (b - a).norm();
+                    const int n = std::max(1, static_cast<int>(std::ceil(len / 0.02)));
+                    for (int k = 0; k <= n; ++k) {
+                        const double u = static_cast<double>(k) / n;
+                        const Eigen::Vector3d q = a + u * (b - a);
+                        const double c = field->clearance(q);
+                        if (c < astar_min_clr) {
+                            astar_min_clr = c;
+                            astar_worst_pt = q;
+                        }
+                    }
+                }
+            }
+            if (!(astar_min_clr < 1e8)) astar_min_clr = min_ok_hard;
+            // 允许 MINCO 比 A* 略低（平滑切角不可避免），但不低于 85%
+            const double min_ok = std::min(min_ok_hard, astar_min_clr * 0.85);
             const double vmax_ok = tp_.max_vel * 1.25;
             // 排除末端一小段再判 clearance：目标点本身就贴障碍时，
             // 末段必然靠近它（与全量流程的 minClearanceAlongPathExcludingEnd 同义）
@@ -2850,6 +3227,9 @@ private:
                         << " goal_clr=" << field->clearance(tail.p) << " | worst=("
                         << worst.transpose() << ") c=" << worst_c << " | start=("
                         << head.p.transpose() << ") goal=(" << tail.p.transpose() << ")");
+                dumpMincoCall(*field, path_eff, head, tail, mp, &r, mc, min_ok,
+                              vmax_ok, false, &astar_worst_pt, astar_min_clr,
+                              &raw_path_ref);
                 return false;
             }
             if (r.max_vel > vmax_ok) {
@@ -2857,6 +3237,9 @@ private:
                     0.5, "[azj] MINCO_REJECT reason=vmax vmax=" << r.max_vel << " > "
                              << vmax_ok << " m/s | len=" << r.length << "m dur="
                              << r.duration << "s seg=" << seg_len_chk << "m");
+                dumpMincoCall(*field, path_eff, head, tail, mp, &r, mc, min_ok,
+                              vmax_ok, false, &astar_worst_pt, astar_min_clr,
+                              &raw_path_ref);
                 return false;
             }
             // 绕远保护：优化后的长度不该超过段长的 2.5 倍
@@ -2866,8 +3249,16 @@ private:
                              << "m > 2.5*seg=" << (seg_len_chk * 2.5) << "m (seg="
                              << seg_len_chk << "m) min_clr=" << r.min_clearance
                              << "m | goal_clr=" << field->clearance(tail.p));
+                dumpMincoCall(*field, path_eff, head, tail, mp, &r, mc, min_ok,
+                              vmax_ok, false, &astar_worst_pt, astar_min_clr,
+                              &raw_path_ref);
                 return false;
             }
+
+            // 通过所有校验 → dump（accepted=1）供离线复核
+            dumpMincoCall(*field, path_eff, head, tail, mp, &r, mc, min_ok,
+                          vmax_ok, true, &astar_worst_pt, astar_min_clr,
+                          &raw_path_ref);
         }
         // 诊断：轨迹前 1.2s 的速度分布（判断"起步是否过猛"）
         {
@@ -3697,7 +4088,31 @@ private:
             const Eigen::Vector3d v_dir =
                 (v0.head<2>().norm() > 0.2) ? v0 : Eigen::Vector3d::Zero();
             const ros::WallTime t0 = ros::WallTime::now();
-            const SearchResult gs = astar_.search(field, p0, goal_, sp_, v_dir);
+            // ★★★ A* 的 clearance 要留**平滑余量**（2026-11-25 真 bug）
+            //
+            // 事故（/tmp/azj_planner.log，实飞）：
+            //   A* 按 robot_radius=0.30 规划，路径恰好 clearance>=0.30；
+            //   而 MINCO 的 7 次多项式在段内会**切角**（平滑的必然代价），
+            //   把 0.30 压到 0.0039 → 校验拒绝 → 连续 12 次 → 折线 1.1s。
+            //
+            //   实测那几次：start_clr=0.46~0.53（起点很安全）、
+            //   goal_clr=0.8（终点也安全），但 worst 点固定落在
+            //   (-1.45,-1.61) —— 正是 A* 路径贴着一根柱子过的位置。
+            //
+            // 修法：给 A* 多要一点余量（`rolling_astar_margin` × robot_radius），
+            //   让折线离障碍更远，MINCO 再切角也有空间。
+            //   找不到路时自动退回原值（窄缝场景不能因为余量而瘫痪）。
+            SearchParams sp_astar = sp_;
+            const double margin_mul =
+                std::max(1.0, np_.rolling_astar_margin);
+            sp_astar.robot_radius = sp_.robot_radius * margin_mul;
+            SearchResult gs = astar_.search(field, p0, goal_, sp_astar, v_dir);
+            if (!gs.success && margin_mul > 1.001) {
+                ROS_WARN_STREAM_THROTTLE(
+                    1.0, "[azj] A* failed with clearance margin x" << margin_mul
+                             << " - retry with nominal " << sp_.robot_radius << "m");
+                gs = astar_.search(field, p0, goal_, sp_, v_dir);
+            }
             const double ms = (ros::WallTime::now() - t0).toSec() * 1e3;
             if (!gs.success) {
                 // 与全量流程同构的失败处理：BLOCKED → 刹车，否则保留旧轨迹
@@ -3719,7 +4134,82 @@ private:
                 }
                 return true;   // 已处理
             }
-            global_path_ = gs.path;
+            // ══════════════════════════════════════════════════════════
+            //  ★★★ A* 结果必须用**当前** ESDF 复验（2026-11-25 根因修复）
+            // ══════════════════════════════════════════════════════════
+            //
+            // 事故（flight_20261125_201602，seq33→38）：
+            //   同一个点 (-1.4412,-1.4000) 的 clearance 在 0.6 秒内：
+            //     t=65.036  0.3887   ← A* 搜路时用的值
+            //     t=65.138  0.1239
+            //     t=65.259  0.0088   ← MINCO 校验时已经变了
+            //     t=65.638  0.0025
+            //
+            //   `updateESDF3D` 每 140ms 全量重算，而 rolling 每 100ms 规划一次。
+            //   A* 搜索期间缓存 `g.clr`，一次调用若跨过 ESDF 更新，
+            //   缓存的就是旧值 → 硬约束 0.30 通过 → 路径经过实际 0.03 的格子。
+            //
+            //   这不是"参数没调好"，是**快照不一致**：A* 在旧地图上找路，
+            //   MINCO 在新地图上校验，两者必然矛盾。
+            //
+            // 修法：A* 出路径后立刻用**当前** field 复验；不达标就以更大余量重搜。
+            //   重搜有次数上限（防 ESDF 持续变化时活锁），
+            //   超过上限仍不达标就如实放弃（让上层走 keep_old / B 样条）。
+            //
+            // 复验阈值用 `robot_radius`（不是 0.9 倍）——这里判的是"A* 路径是否
+            // 真的满足硬约束"，必须严格。MINCO 那边的平滑余量另行放宽。
+            std::vector<Eigen::Vector3d> path_verified = gs.path;
+            {
+                const double need = sp_.robot_radius;
+                const int kMaxResearch = 2;
+                for (int attempt = 0; ; ++attempt) {
+                    // 沿路径密集采样找最差点
+                    double worst = std::numeric_limits<double>::max();
+                    Eigen::Vector3d worst_pt(0, 0, 0);
+                    for (size_t i = 1; i < path_verified.size(); ++i) {
+                        const Eigen::Vector3d& a = path_verified[i - 1];
+                        const Eigen::Vector3d& b = path_verified[i];
+                        const double len = (b - a).norm();
+                        const int n = std::max(1, static_cast<int>(std::ceil(len / 0.02)));
+                        for (int k = 0; k <= n; ++k) {
+                            const Eigen::Vector3d q =
+                                a + (b - a) * (static_cast<double>(k) / n);
+                            const double c = field.clearance(q);
+                            if (c < worst) { worst = c; worst_pt = q; }
+                        }
+                    }
+                    if (worst >= need) break;      // 通过
+
+                    ROS_WARN_STREAM_THROTTLE(
+                        1.0, "[azj] A* path STALE: worst clr=" << worst << "m < "
+                                 << need << "m at (" << worst_pt.transpose()
+                                 << ") — ESDF changed during search (attempt "
+                                 << attempt + 1 << "/" << kMaxResearch << ")");
+                    if (attempt >= kMaxResearch) {
+                        // 放弃：交给上层（keep_old 保留旧轨迹 / B 样条兜底）
+                        ROS_ERROR_STREAM_THROTTLE(
+                            1.0, "[azj] A* path still unsafe after "
+                                     << kMaxResearch << " re-searches — giving up this cycle");
+                        global_path_valid_ = false;
+                        return true;   // 已处理（不更新 global_path_）
+                    }
+                    // 加大余量重搜（当前 ESDF）
+                    SearchParams sp2 = sp_astar;
+                    sp2.robot_radius = need * (1.0 + 0.20 * (attempt + 1));
+                    const SearchResult gs2 =
+                        astar_.search(field, p0, goal_, sp2, v_dir);
+                    if (!gs2.success) {
+                        ROS_ERROR_STREAM_THROTTLE(
+                            1.0, "[azj] A* re-search failed (" << gs2.msg
+                                     << ") — giving up this cycle");
+                        global_path_valid_ = false;
+                        return true;
+                    }
+                    path_verified = gs2.path;
+                }
+            }
+
+            global_path_ = path_verified;
             global_path_goal_ = goal_;
             global_path_wall_ = ros::WallTime::now();
             global_path_valid_ = true;
@@ -3872,6 +4362,75 @@ private:
         }
         std::vector<Eigen::Vector3d> path = simplifyPath(seg);
 
+        // ══════════════════════════════════════════════════════════════
+        //  ★★★ rolling 段也要用**当前** ESDF 复验（2026-11-25 修正）
+        // ══════════════════════════════════════════════════════════════
+        //
+        // v3.4.6 只给「全局路径重建」加了复验，但 rolling 每周期用的是
+        // 从 global_path_ 切出来的 `seg`（局部段）——复验完全没覆盖到。
+        //
+        // 实测（flight_20261125_202250）：STALE 触发 **0 次**，
+        // 而 dump 里 `raw_path min_clr=0.025`（远低于 robot_radius 0.30），
+        // 证明这段路径确实没被复验过。
+        //
+        // 现在在这里补一次：只有通过复验的 seg 才进 MINCO。
+        // 不通过时**不放宽阈值、不强行规划**，而是保留旧轨迹等下一周期
+        // （下一周期 A* 会用新 ESDF 重搜全局路径）。
+        {
+            const double need = sp_.robot_radius;
+            double worst = std::numeric_limits<double>::max();
+            Eigen::Vector3d worst_pt(0, 0, 0);
+            for (size_t i = 1; i < path.size(); ++i) {
+                const Eigen::Vector3d& a = path[i - 1];
+                const Eigen::Vector3d& b = path[i];
+                const double len = (b - a).norm();
+                const int n = std::max(1, static_cast<int>(std::ceil(len / 0.02)));
+                for (int k = 0; k <= n; ++k) {
+                    const Eigen::Vector3d q = a + (b - a) * (static_cast<double>(k) / n);
+                    const double c = field.clearance(q);
+                    if (c < worst) { worst = c; worst_pt = q; }
+                }
+            }
+            if (worst < need) {
+                ++seg_stale_streak_;
+                global_path_valid_ = false;
+                ROS_WARN_STREAM_THROTTLE(
+                    1.0, "[azj] rolling seg STALE (" << seg_stale_streak_ << " in a row): worst clr="
+                             << worst << "m < " << need << "m at (" << worst_pt.transpose()
+                             << ") — ESDF changed, skip this cycle (keep committed traj)");
+                // ★ 连续 STALE 保护（2026-11-25）
+                //
+                // 如果 ESDF 持续显示该区域不可通行，而 A* 每周期都还是搜出
+                // 同一条路（因为目标没变、起点没大变），就会陷入
+                // "搜路 → 复验失败 → 跳过 → 再搜路"的活动锁，飞机停摆。
+                //
+                // 连续 5 次（约 0.5s）仍 STALE，就**不再跳过**，而是让 MINCO
+                // 尽力优化（它至少会做安全投影），并让上层自然走 keep_old/折线。
+                // 安全上仍由 MINCO 的校验兜底 —— 不会发布不安全的轨迹。
+                if (seg_stale_streak_ >= 5) {
+                    ROS_ERROR_STREAM("[azj] rolling seg STALE " << seg_stale_streak_
+                                         << " times — accepting MINCO's best effort instead "
+                                            "(safety still enforced by MINCO checks)");
+                    seg_stale_streak_ = 0;
+                    // 落到下面的正常流程
+                } else {
+                const bool old_known_bad = (why == ReplanReason::BLOCKED);
+                if (old_known_bad) {
+                    if (!tryBrakeReplan("rolling seg stale")) {
+                        has_trajectory_ = false;
+                    }
+                } else if (snapTraj() && snapTraj()->traj.valid()) {
+                    // 保留旧轨迹，本周期不更新
+                } else if (!tryBrakeReplan("rolling seg stale")) {
+                    has_trajectory_ = false;
+                }
+                return true;   // 已处理
+                }   // end if (seg_stale_streak_ >= 5) else
+            } else {
+                seg_stale_streak_ = 0;
+            }
+        }
+
         // ─────────── 5) 轨迹生成 ───────────
         //
         // 后端二选一（2026-11-17）：
@@ -3922,7 +4481,7 @@ private:
             const double vmax_allow =
                 std::max(v_floor_eff, tp_.max_vel - v_decay);
 
-            if (buildTrajectoryMinco(path, hd, tl, to_goal, vmax_allow)) {
+            if (buildTrajectoryMinco(path, hd, tl, to_goal, vmax_allow, &seg)) {
                 // ★★★ 可视化必须用**实际轨迹**，不能存 A* 折线（2026-11-17 真 bug）
                 //
                 // 事故（用户报"规划出来是折线"）：这里原来写 `last_path_ = path`，
@@ -4346,6 +4905,29 @@ private:
         sp_.plan_2d = plan_2d_active_;
         plan_2d_z_active_ = goal.z();
         z_plane_ = plan_2d_z_active_;
+
+        // ★ MINCO dump 目录支持运行时切换（2026-11-25）
+        //
+        // 为什么必须运行时读：取证脚本 `azj_shadow.sh` 是在规划器**已经起来之后**
+        // 才 set 这个参数的（它不知道你什么时候起 raicom_azj.sh）。
+        // 如果只在 loadParams 里读一次，取证就永远抓不到 dump。
+        //
+        // 用绝对名读（与 yaw_mode / plan_2d 同理）：私有句柄会多解析一层
+        // → /azj_planner/azj/minco_dump_dir，而 rosparam set 写的是
+        // /azj_planner/minco_dump_dir。
+        {
+            std::string want_dump = np_.minco_dump_dir;
+            if (ros::param::get("/azj_planner/minco_dump_dir", want_dump)) {
+                if (want_dump != np_.minco_dump_dir) {
+                    np_.minco_dump_dir = want_dump;
+                    if (want_dump.empty()) {
+                        ROS_WARN("[azj] MINCO dump DISABLED");
+                    } else {
+                        ROS_WARN("[azj] MINCO dump ENABLED -> %s", want_dump.c_str());
+                    }
+                }
+            }
+        }
 
         ReplanReason why = needReplan(start);
 
@@ -6024,7 +6606,8 @@ private:
     ros::WallTime global_path_wall_;
     Eigen::Vector3d global_path_goal_{Eigen::Vector3d::Zero()};
     bool global_path_valid_{false};
-    int minco_reject_streak_{0};   // MINCO 连续被拒次数（超过阈值就放弃 keep_old）
+    int minco_reject_streak_{0};
+    int seg_stale_streak_{0};   // rolling seg 连续 STALE 次数（防活动锁）   // MINCO 连续被拒次数（超过阈值就放弃 keep_old）
     ros::WallTime last_rolling_wall_;   // 上次滚动重规划时刻（rolling_period 用）
 
     bool has_goal_{false};

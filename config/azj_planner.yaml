@@ -642,6 +642,15 @@ azj:
   # MINCO 居中权重。30 是横扫实测最优（直通道半宽 1.5m、初值偏 0.8m，
   # 60 迭代做到横向不平衡 0.05m、min_clr 1.473/1.5）。
   # 含义：居中权重 = jerk 能量的 30 倍 —— 对应"不珍惜时间空间，只要安全居中"。
+  # MINCO 输入/输出完整 dump（2026-11-25）。
+  # 设成目录（如 /tmp/azj_minco_dump）后，每次 MINCO 调用写一个文本文件：
+  #   输入路径逐点 + clearance
+  #   输出轨迹逐点 + clearance
+  #   三道校验的判定值与阈值
+  #   优化参数（w_mid / w_obs / iterations / lock_z ...）
+  #   环境 clearance 网格（可离线复现，不依赖 bag 里的点云帧）
+  # 空字符串 = 关闭（生产用）。
+  minco_dump_dir: ""
   minco_w_mid: 30.0
   minco_w_obs: 50.0       # 安全硬下界的软权重
   minco_w_smooth: 1.0     # jerk 泛函
@@ -694,6 +703,12 @@ azj:
   rolling_track_acc: 1.0
   # 参考速度允许领先飞机的量 [m/s]。实测 0.05 最好（0.63 会横偏离翻倍）。
   rolling_v_lead: 0.05
+  # A* 的 clearance 余量倍数（给 MINCO 平滑切角留空间）。
+  # 1.0 = 关闭。实测 1.0 时 A* 路径 clearance 恰好 0.30，
+  # MINCO 段内切角压到 0.0039 → 连续被拒 → 折线。
+  # 1.3 让折线离障碍 0.39m，切角后仍有 ~0.3 余量。
+  # 找不到路会自动退回 1.0，窄缝场景不会瘫痪。
+  rolling_astar_margin: 1.30
   # 从旧轨迹继承的引导段长度 [m]（学 SUPER 的 receding_dis）。
   # 新轨迹前 N 米直接沿用旧轨迹几何 → 切换时空间重合 → 无横向突变。
   # 0 = 关闭。2.0 在 1m/s 下约 2s 前视，覆盖一个滚动周期又留足重规划余地。

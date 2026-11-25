@@ -169,18 +169,64 @@ MincoOptResult MincoOptimizer::optimize(const StatePVAJ& head, const StatePVAJ& 
                 betaBasis(j * ds, b0, b1, b2, b3);
                 const Eigen::Vector3d pos = ci.transpose() * b0;
                 const double c = field.clearance(pos);
-                if (!std::isfinite(c) || c <= 0.0) continue;
-                if (c < cap0) m0 += wgt * std::pow(ref0 / c, params.alpha);
-                if (c < params.safe_margin) {
-                    const double d = params.safe_margin - c;
+                // ★ 障碍内部（c<=0）**必须计入**安全统计（2026-11-25 真 bug）
+                //
+                // 原来 `c <= 0.0 → continue`，于是已穿障碍的点对 o0 毫无贡献：
+                //   实测某场景真实 o0=2.13（25/41 点不安全），代码算出的 o0=0.048，
+                //   差 **44 倍** → sc_obs = 1/0.048 ≈ 21 虽然很大，但起点不在
+                //   障碍里的正常场景 o0≈0 → sc_obs=1（不放大）→ 安全项偏弱。
+                //
+                // 更严重的是：`c <= 0` 在**优化循环**里也被跳过（下面同一个坑），
+                // 所以"已经穿进去"的点没有任何梯度把它推出来 —— 这就是
+                // 初始路径穿障碍时 MINCO 完全救不回来的原因（实测
+                // 初始 min_clr=-0.30，优化后 -0.2985，纹丝不动）。
+                //
+                // 约定：ClearanceField 用 -1 表示"未知/不可通行"（kUnknownClearance），
+                // 那是"没有数据"不是"距离"，必须排除；其余负值是真的在障碍内。
+                const bool unknown_marker =
+                    (std::fabs(c - ClearanceField::kUnknownClearance) < 1e-9);
+                if (!std::isfinite(c) || unknown_marker) continue;
+                const double c_eff = std::max(c, 0.0);   // 障碍内按表面处理
+                if (c_eff > 1e-9 && c_eff < cap0)
+                    m0 += wgt * std::pow(ref0 / c_eff, params.alpha);
+                if (c_eff < params.safe_margin) {
+                    const double d = params.safe_margin - c_eff;
                     o0 += wgt * d * d;
                 }
             }
         }
-        for (int k = 0; k < N - 1; ++k) a0 += (q.col(k) - q0.col(k)).squaredNorm();
+        // ★★★ 锚定项的归一化**不能这么做**（2026-11-25 实飞 dump 定位）
+        //
+        // 原来 `for k: a0 += |q_k - q0_k|²` —— 但 q 就是从 q0 初始化的，
+        // 所以 **a0 ≡ 0** → `sc_anchor = 1`（永不放大）。
+        //
+        // 后果（flight_20261125_195750 / minco_00045 实测）：
+        //   sc_mid  = 0.0028   ← 居中项被缩小 357 倍
+        //   sc_obs  = 12.6     ← 安全项被放大 12.6 倍
+        //   sc_anch = 1        ← 锚定项**没放大**
+        //   → 有效权重变成 w_mid×0.0028 : w_anchor×1 = 0.084 : 0.10
+        //   → 居中几乎失效，但锚定也没强到拉住路径
+        //   → MINCO 绕远 1.9 倍（输入 4.15m → 输出 7.80m）
+        //   → 长度变长 → 时间被压 → vmax 4.47 / amax 20.4 → 被拒 → 折线
+        //
+        // 正确语义：锚定项的量级应该用"路径本身的尺度"来衡量，
+        // 而不是"当前偏离量"（后者恒为 0）。
+        // 取 Σ|q0_k - q0_{k-1}|² （相邻内点间距的平方和）作为基准，
+        // 这样"内点移动一个典型段长"时贡献 ≈ 1。
+        {
+            double scale = 0.0;
+            for (int k = 1; k < N - 1; ++k)
+                scale += (q0.col(k) - q0.col(k - 1)).squaredNorm();
+            if (scale < 1e-9) scale = 1.0;
+            sc_anchor = 1.0 / scale;
+        }
         if (m0 > 1e-9) sc_mid = 1.0 / m0;
         if (o0 > 1e-9) sc_obs = 1.0 / o0;
-        if (a0 > 1e-9) sc_anchor = 1.0 / a0;
+        if (std::getenv("AZJ_MINCO_DBG_SCALE")) {
+            std::printf("[sc] E0=%.3g tsum=%.3g m0=%.6g o0=%.6g a0=%.6g "
+                        "-> sc_e=%.3g sc_mid=%.3g sc_obs=%.3g sc_anch=%.3g\n",
+                        e0, tsum, m0, o0, a0, sc_energy, sc_mid, sc_obs, sc_anchor);
+        }
     }
 
     // z 边界的内点收缩量（给 7 次多项式的段内 overshoot 留空间）
@@ -250,6 +296,10 @@ MincoOptResult MincoOptimizer::optimize(const StatePVAJ& head, const StatePVAJ& 
                 const Eigen::Vector3d vel = ci.transpose() * b1;
                 const Eigen::Vector3d acc = ci.transpose() * b2;
 
+                // 该采样点对应的**初始内点**索引（用于梯度退化时拉回 A* 路径）
+                // 段 i 的 s∈[0,Ti)：前一半归段首内点 (i-1)，后一半归段尾内点 (i)
+                const int k_anchor = (s / std::max(1e-9, Ti) < 0.5) ? (i - 1) : i;
+
                 Eigen::Vector3d gPos = Eigen::Vector3d::Zero();
                 Eigen::Vector3d gVel = Eigen::Vector3d::Zero();
                 Eigen::Vector3d gAcc = Eigen::Vector3d::Zero();
@@ -261,22 +311,69 @@ MincoOptResult MincoOptimizer::optimize(const StatePVAJ& head, const StatePVAJ& 
                 // 这是用户"必须走障碍正中间"的直接数学表达（与
                 // curve_optimizer 的 w_mid 同源，见其注释）。
                 {
-                    const double c = field.clearance(pos);
-                    if (std::isfinite(c) && c > 0.0) {
+                    const double c_raw = field.clearance(pos);
+                    // ★ 障碍内部同样要罚（2026-11-25 真 bug，见归一化处的说明）
+                    const bool unk =
+                        (std::fabs(c_raw - ClearanceField::kUnknownClearance) < 1e-9);
+                    const double c = std::max(c_raw, 0.0);
+                    if (std::isfinite(c_raw) && !unk) {
                         Eigen::Vector3d gc;
                         if (field.clearanceGradient(pos, gc) && gc.allFinite()) {
-                            if (c < cap) {
-                                // f = (ref/c)^a,  df/dp = -a * (ref/c)^a / c * dc/dp
-                                const double ratio = ref / c;
-                                const double f = std::pow(ratio, params.alpha);
-                                tmp += params.w_mid * sc_mid * f;
-                                gPos += params.w_mid * sc_mid * (-params.alpha * f / c) * gc;
-                            }
-                            if (c < params.safe_margin) {
+                            // ★★★ 安全区域内**禁止**居中项（2026-11-25 真 bug）
+                            //
+                            // 事故（/tmp/azj_planner.log，实飞）：
+                            //   MINCO 连续 10 次被拒，min_clr 从 0.20 掉到 0.00003m，
+                            //   worst 固定在 (-1.45,-1.59)，持续 1.23s → 落成折线。
+                            //
+                            // 算一下当时的代价量级（c=0.0044, ref=1.0, alpha=2）：
+                            //   居中项 = w_mid(30) × (1.0/0.0044)² = 30 × 51529 ≈ 1.55e6
+                            //   安全项 = w_obs(50) × (0.30-0.0044)² = 50 × 0.088 ≈ 4.4
+                            //   → 居中项是安全项的 **35 万倍**
+                            //
+                            // 也就是说：优化器在"快撞上"的时候，仍在全力追求"居中"，
+                            // 而居中的梯度方向把它往缝里挤 —— 安全项完全被淹没。
+                            // 这直接违反本项目的首要原则（安全优先于居中）。
+                            //
+                            // 正确语义：
+                            //   c < safe_margin  → **只罚安全**，一个字的居中都不谈
+                            //   c >= safe_margin → 安全了，才开始追求居中
+                            // 两个分支互斥，权重再也不用互相竞争。
+                            const bool unsafe = (c < params.safe_margin);
+
+                            if (unsafe) {
+                                // 危险区：只推出去
                                 const double d = params.safe_margin - c;
                                 tmp += params.w_obs * sc_obs * d * d;
-                                // d(d^2)/dp = -2d * dc/dp
                                 gPos += params.w_obs * sc_obs * (-2.0 * d) * gc;
+
+                                // ★★ ESDF 梯度在障碍内部会**退化为 0**，靠它推不出来
+                                //     （2026-11-25 第二个真 bug）
+                                //
+                                // 实测（box SDF 中心）：clr=-0.35 但 grad=(0,0,0)。
+                                // 真实 rog_map 的 evaluateFirstGrad 在 ESDF≈0 的区域
+                                // 同样给不出有效方向。于是"安全项有代价但无梯度"
+                                // → 优化器照样把曲线压进障碍（实测 w_obs 加到
+                                // 10000 倍仍无改善，min_clr 稳定在 -0.338）。
+                                //
+                                // 兜底：危险区里**额外拉回初始路径**（A* 给的，它
+                                // 满足 clearance >= robot_radius 的硬约束）。
+                                // 这不是"放弃优化"，而是"在梯度失效时退回保守解"。
+                                if (gc.norm() < 0.05 && k_anchor >= 0 && k_anchor < N - 1) {
+                                    const Eigen::Vector3d back = q0.col(k_anchor) - pos;
+                                    tmp += params.w_obs * sc_obs * back.squaredNorm() * 4.0;
+                                    gPos += params.w_obs * sc_obs * 8.0 * back;
+                                }
+                            } else if (c < cap) {
+                                // 安全区：追求居中
+                                //
+                                // 居中项仍要 clamp：c 刚过 safe_margin 时
+                                // (ref/c)^alpha 仍有 ~11，乘 w_mid 后量级不小，
+                                // 限制上限避免它压过平滑项。
+                                const double ratio = ref / c;
+                                const double f = std::min(
+                                    std::pow(ratio, params.alpha), 1.0e3);
+                                tmp += params.w_mid * sc_mid * f;
+                                gPos += params.w_mid * sc_mid * (-params.alpha * f / c) * gc;
                             }
                         }
                     }
@@ -527,16 +624,36 @@ MincoOptResult MincoOptimizer::optimize(const StatePVAJ& head, const StatePVAJ& 
                     Eigen::Matrix<double, 8, 1> b0, b1, b2, b3;
                     betaBasis(s, b0, b1, b2, b3);
                     const Eigen::Vector3d pos = ci.transpose() * b0;
-                    const double c = field.clearance(pos);
-                    if (!std::isfinite(c) || c >= params.safe_margin) continue;
-                    Eigen::Vector3d gc;
-                    if (!field.clearanceGradient(pos, gc) || !gc.allFinite()) continue;
-                    if (gc.norm() < 1e-6) continue;
+                    const double c_raw = field.clearance(pos);
+                    const bool unk =
+                        (std::fabs(c_raw - ClearanceField::kUnknownClearance) < 1e-9);
+                    if (!std::isfinite(c_raw) || unk) continue;
+                    const double c = std::max(c_raw, 0.0);
+                    if (c >= params.safe_margin) continue;
+
                     // 归属内点：段内 s < 0.5 归段首内点，否则归段尾内点
                     const int qi = (s / Ti < 0.5) ? (i - 1) : i;
                     if (qi < 0 || qi >= N - 1) continue;
-                    const double push = (params.safe_margin - c) * 0.6;
-                    q.col(qi) += gc.normalized() * push;
+
+                    Eigen::Vector3d gc;
+                    const bool have_grad =
+                        field.clearanceGradient(pos, gc) && gc.allFinite() &&
+                        gc.norm() > 1e-6;
+
+                    if (have_grad) {
+                        const double push = (params.safe_margin - c) * 0.6;
+                        q.col(qi) += gc.normalized() * push;
+                    } else {
+                        // ★ 梯度退化（ESDF 在障碍内/边界处常见，实测 box 中心
+                        //   grad=(0,0,0)）→ 无法"推出去"。
+                        //   改用**拉回 A\* 初始内点**：那是硬约束搜出来的，
+                        //   代表该段的可行解。这不是放弃优化，是保守退化。
+                        //
+                        //   强度随危险程度增加：c 越小，拉得越狠。
+                        const double w = std::min(1.0, (params.safe_margin - c) /
+                                                        std::max(1e-3, params.safe_margin));
+                        q.col(qi) += w * 0.5 * (q0.col(qi) - q.col(qi));
+                    }
                     ++nfixed;
                 }
             }
