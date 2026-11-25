@@ -149,6 +149,22 @@ struct CurveOptParams {
     /// 迭代次数与初始步长。
     /// 步长不宜大：曾有 step=0.08×√ncp≈0.33m/步，曲线几十步就冲穿墙。
     int iterations{150};
+
+    /// 收敛停滞提前退出（2026-11-14）。
+    ///
+    /// 连续 stall_iters 次迭代的代价改善都小于 rel_improve 时停止。
+    ///
+    /// ★ 为什么需要：实测单次曲线优化耗时 0.9~1.1 秒（ncp=60），
+    /// 而 `curve: iters=60` 说明**迭代次数每次都跑满**——大量迭代在
+    /// 代价几乎不变的状态下仍在做 4 次线搜索（每次全量重采样 ESDF）。
+    /// 这段时间主线程阻塞，飞机以 1 m/s 前进约 1 米，
+    /// 新轨迹起点直接过期 → `deviated` → 又重规划（活锁）。
+    ///
+    /// 提前退出不改最终形状（收益已接近零），只砍掉无效计算。
+    /// 设 0 关闭。
+    int stall_iters{8};
+    /// 停滞判定的相对改善阈值（1e-4 = 0.01%）
+    double rel_improve{1e-4};
     double step_init{0.02};
 
     /// 末端是否钉死。false 时只做弱约束（用于闭环重规划时终点也在动的情况）。
@@ -171,6 +187,27 @@ struct CurveOptParams {
     bool enable_z_bounds{false};
     double z_min{-1e9};
     double z_max{1e9};
+
+    /// z 方向的高度保持项（2026-11-05 新增）。
+    ///
+    /// ★ 为什么必须加：本优化器原来的目标函数只有
+    ///   smooth / mid(clearance) / obs / anchor / end 五项，
+    ///   **完全没有高度项**，z 方向只有 z_min/z_max 硬边界。
+    ///
+    ///   后果（实测事故）：A* 用 w_height 把路径压在 0.85 附近，
+    ///   曲线优化只追求更大 clearance，一路把 z 推高到 z_max=1.0 的硬边界
+    ///   → 日志 `path z=[0.05, 0.999289]` → 飞机跟着爬到 1.0076m
+    ///   → 越界后又被 PX4 位置环慢慢拽回 0.80，表现为"打点后先冲高再掉高"。
+    ///
+    ///   柱林场景里柱子高 1.55m、天花板 1.0m，上下绕障根本不可能，
+    ///   所以爬高没有任何几何收益，纯粹是优化缺项导致的副作用。
+    ///
+    /// 0 = 关闭（退回旧行为）。
+    double w_height{0.0};
+    /// 目标高度 [m]。0 且 w_height>0 时按"起点高度"用。
+    double height_ref{std::numeric_limits<double>::quiet_NaN()};
+    /// 归一化尺度 [m]，与 A* 的 height_scale 同义。
+    double height_scale{1.0};
 
     /// true = 2D 规划：把 z 分量完全锁死（梯度清零 + 控制点 z 保持初值）。
     ///

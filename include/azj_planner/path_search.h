@@ -138,10 +138,13 @@ struct SearchResult {
 /// 其中 c 取相邻两格 clearance 的较小值（保守）。
 class ClearanceAStar {
 public:
+    /// @param v_dir 入场速度方向（非零时用于"起点引出"，避免首段
+    ///              被栅格 45° 量化成急转）。传 Zero 则关闭该功能。
     SearchResult search(const ClearanceField& field,
                         const Eigen::Vector3d& start,
                         const Eigen::Vector3d& goal,
-                        const SearchParams& params) const;
+                        const SearchParams& params,
+                        const Eigen::Vector3d& v_dir = Eigen::Vector3d::Zero()) const;
 };
 
 /// 保形简化：只删除几乎共线的中间点，**绝不拉直**。

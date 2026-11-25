@@ -61,16 +61,22 @@ azj_planner/
 │   ├── clearance_field.h     # clearance 场抽象（不依赖 ROS，可离线单测）
 │   ├── path_search.h         # A* + 简化/平滑接口
 │   ├── trajectory.h          # 时间参数化（路径 → p/v/a 对时间）
-│   └── curve_optimizer.h     # 折线 → C2 连续 B 样条（ESDF 梯度优化）
+│   ├── curve_optimizer.h     # 折线 → C2 连续 B 样条（ESDF 梯度优化）
+│   ├── minco.h               # MINCO s=4 参数化（移植，见文件头许可）
+│   └── minco_optimizer.h     # MINCO 优化器（ESDF 代价 + 时间联合优化）
 ├── src/
 │   ├── path_search.cpp       # 核心搜索算法
 │   ├── trajectory.cpp        # 沿弧长的速度规划（TOPP 简化版）
 │   ├── curve_optimizer.cpp   # B 样条求值 + 曲线优化（含线搜索）
+│   ├── minco.cpp             # MINCO 线性系统 + 梯度回传
+│   ├── minco_optimizer.cpp   # 居中/安全/动力学代价
 │   └── azj_planner_node.cpp  # ROS 节点，继承 rog_map::ROGMapROS
 ├── test/
 │   ├── offline_clearance_test.cpp   # 居中性质验证（含 ASCII 俯视图）
 │   ├── trajectory_test.cpp          # 速度曲线验证
 │   ├── curve_optimizer_test.cpp     # 曲线 + 两侧等距验证
+│   ├── minco_test.cpp               # MINCO 数学正确性（梯度 vs 数值差分）
+│   ├── minco_optimizer_test.cpp     # MINCO 优化器行为（居中/安全/不减速）
 │   └── e2e_publish_test.py          # 闭环端到端验证（含安全静默）
 ├── config/azj_planner.yaml
 ├── launch/azj_planner.launch
@@ -80,6 +86,54 @@ azj_planner/
 
 **注意包名**：`azj_planner`，不是 `Azj-planner`。catkin 要求包名匹配 `^[a-z][a-z0-9_]*$`，
 大写字母和连字符都会被直接拒绝。
+
+---
+
+## 2.5 轨迹后端：MINCO（默认）
+
+规划分三层，每层职责不同：
+
+```
+A* (path_search)      → 折线 + 居中代价（clearance 当连续收益）
+   ↓
+MINCO (minco_optimizer) → 7 次多项式，形状与时间**联合**优化
+   ↓
+publishTick           → 50Hz 采样发布 pos_cmd
+```
+
+### 为什么从 B 样条换成 MINCO
+
+B 样条（`curve_optimizer`）只约束起点的**速度**，不约束加速度。
+而滚动重规划每 0.1s 就重建一次轨迹，于是每条新轨迹都从 `v0` 靠
+`max_acc` 重新加速，**速度永远停在加速段**（实测 `|v0|` 恒 0.285，
+而 `max_vel=1.0`）。
+
+MINCO 的 `setConditions(headPVAJ, tailPVAJ, pieceNum)` 把起点
+**p / v / a / j 全部硬约束**，段间 C3 连续 —— "接着飞"是结构性保证，
+不依赖速度补偿。
+
+### 起点的 a / j 从旧轨迹取，不是 odom 差分
+
+这是 MINCO 相对 B 样条的全部价值所在：告诉优化器"我正以 a 加速"。
+拿不到旧轨迹（新目标）时才置 0，那是"从静止起步"的正确语义。
+
+### 后端可切换
+
+```yaml
+traj_backend: 1    # 1 = MINCO（默认）, 0 = B 样条 + TOPP（旧路径，保留可回退）
+```
+
+两个后端都保留，出问题改一个参数即可回退，不用改代码。
+
+### 上游来源与许可
+
+`minco.h` / `minco.cpp` 的算法与带状线性系统构造移植自
+[SUPER](https://github.com/hku-mars/SUPER)（HKU MaRS Lab），
+其 MINCO 实现又源自 Zhepei Wang 的 MIT 许可版本（ego-planner 同源）。
+原许可与署名保留在 `minco.h` 文件头。
+
+本包对上游代码的改动：去掉 ROS/SUPER 数据类型依赖，改为
+`azj_planner` 命名空间，新增 `evaluatePVAJ()` 直接求值接口。
 
 ---
 

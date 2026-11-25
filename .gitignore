@@ -22,3 +22,6 @@ __pycache__/
 *.bag
 *.bag.active
 *.log
+
+# 本地备份文件（不提交）
+*.bak_*

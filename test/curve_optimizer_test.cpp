@@ -12,6 +12,7 @@
 #include <Eigen/Geometry>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -162,9 +163,15 @@ int main() {
             cp.step_init = 0.08;
 
             CurveOptimizer opt;
+            const auto t_cv0 = std::chrono::steady_clock::now();
             const auto cr = opt.optimize(poly, field, cp);
+            const double ms_cv = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_cv0).count();
             check(cr.success, "曲线优化成功", cr.msg);
             if (cr.success) {
+                std::printf("     优化: iters=%d/%d  %.1fms %s\n",
+                            cr.iterations, cp.iterations, ms_cv,
+                            cr.iterations < cp.iterations ? "(early-converged)" : "(full)");
                 std::vector<Vector3d> pts, tgs;
                 cr.spline.sampleByArcLength(0.05, pts, tgs);
                 const TurnStats ts_cur = turnStats(pts);
@@ -283,9 +290,15 @@ int main() {
             cp.iterations = 150;
             cp.safe_margin = 0.30;
             CurveOptimizer opt;
+            const auto t_cv0 = std::chrono::steady_clock::now();
             const auto cr = opt.optimize(poly, field, cp);
+            const double ms_cv = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_cv0).count();
             check(cr.success, "曲线优化成功", cr.msg);
             if (cr.success) {
+                std::printf("     优化: iters=%d/%d  %.1fms %s\n",
+                            cr.iterations, cp.iterations, ms_cv,
+                            cr.iterations < cp.iterations ? "(early-converged)" : "(full)");
                 std::vector<Vector3d> pts, tgs;
                 cr.spline.sampleByArcLength(0.05, pts, tgs);
                 const TurnStats ts1 = turnStats(pts);
@@ -331,9 +344,15 @@ int main() {
             cp.iterations = 120;
             cp.w_obs = 200.0;      // 窄缝里安全权重要更高
             CurveOptimizer opt;
+            const auto t_cv0 = std::chrono::steady_clock::now();
             const auto cr = opt.optimize(poly, field, cp);
+            const double ms_cv = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_cv0).count();
             check(cr.success, "窄通道曲线优化成功", cr.msg);
             if (cr.success) {
+                std::printf("     优化: iters=%d/%d  %.1fms %s\n",
+                            cr.iterations, cp.iterations, ms_cv,
+                            cr.iterations < cp.iterations ? "(early-converged)" : "(full)");
                 std::vector<Vector3d> pts, tgs;
                 cr.spline.sampleByArcLength(0.05, pts, tgs);
                 double mn = 1e9, mx_lat = 0;

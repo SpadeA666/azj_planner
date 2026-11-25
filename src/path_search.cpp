@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <limits>
 #include <queue>
@@ -118,7 +119,11 @@ bool segmentClearanceOk(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
 SearchResult ClearanceAStar::search(const ClearanceField& field,
                                    const Eigen::Vector3d& start,
                                    const Eigen::Vector3d& goal,
-                                   const SearchParams& params) const {
+                                   const SearchParams& params,
+                                   const Eigen::Vector3d& v_dir_in) const {
+    const bool has_v_dir = (v_dir_in.head<2>().norm() > 0.2);
+    const Eigen::Vector3d v_dir = has_v_dir ? v_dir_in.normalized()
+                                            : Eigen::Vector3d::Zero();
     SearchResult res;
 
     if (!(params.resolution > 0.0)) {
@@ -224,12 +229,45 @@ SearchResult ClearanceAStar::search(const ClearanceField& field,
         return cost;
     };
 
-    // 起点例外：飞机当前所在位置必然是「可通行」的，否则无法规划。
+    // 起点例外：飞机当前所在位置必须是可规划的，否则整个规划器瘫痪。
+    //
+    // ★★ 判据从 `> 0` 放宽到 `>= 0`（2026-11-14 重大修正）
+    //
+    // `clearance == 0` 的语义是"**贴着障碍表面**"，不是"在障碍内部"。
+    // 飞机趴在地面 / 紧贴柱子时，起点 clearance 就是 0。此时拒绝规划
+    // 意味着**规划器彻底瘫痪**，飞机完全没有参考 —— 比"从不安全位置
+    // 规划出来"危险得多。
+    //
+    // 实测（/tmp/azj_flight_20261114_214929）：
+    //   t=36.994  start diag: pos=(0,0,0.05) esdf=0.000 unknown=0
+    //             clearance_used=0.000
+    //   → 本判据为假 → `plan failed: start is inside an obstacle`
+    //     **连续 15 次**（36.99~51.99 每秒一次）→ 飞机无参考 → 掉高
+    //
+    // 注意 2D 模式的特殊性：`PillarClearanceField` 在 z_half=0 时
+    // **完全忽略 p.z**，直接用规划平面（plane=goal.z）查 clearance。
+    // 所以"抬高起点 z"对 2D 无效 —— 只能靠放宽这个判据。
+    // （3D 模式下 replanCallback 的逐步抬升仍然有用。）
+    //
+    // 逃逸能力由下面的 escape 逻辑保证：起点 clearance < robot_radius 时，
+    // 允许走向"不比起点更差"且"在 escape_radius 内"的邻居。
     const double start_clr = getClr(g, si, sj, sk, field);
-    const bool start_passable = start_clr > 0.0;
+    const bool start_passable = start_clr >= -1e-9;   // kUnknownClearance(-1) 仍拒绝
     if (!start_passable) {
-        res.msg = "start is inside an obstacle (ESDF <= 0); refusing to plan";
+        res.msg = "start is deeply inside an obstacle (clearance=" +
+                  std::to_string(start_clr) + "); refusing to plan";
         return res;
+    }
+    if (start_clr < 1e-9) {
+        // ⚠ azj_core 是纯算法库，**不能依赖 ROS**（否则链接不过）。
+        // 用 fprintf + 静态计数做节流；核心信息同时体现在 res.msg 里。
+        static int touch_cnt = 0;
+        if (touch_cnt++ % 20 == 0) {
+            std::fprintf(stderr,
+                "[azj-plansearch] start touches an obstacle (clearance=%.3f m) - "
+                "planning via the escape rule (robot_radius=%.2f, escape_radius=%.2f)\n",
+                start_clr, params.robot_radius, params.escape_radius);
+        }
     }
 
     std::priority_queue<OpenEntry, std::vector<OpenEntry>, std::greater<OpenEntry>> open;
@@ -372,9 +410,60 @@ SearchResult ClearanceAStar::search(const ClearanceField& field,
     }
     if ((g_use - raw.back()).norm() > 1e-9) raw.push_back(g_use);
 
+    // ══════════════════════════════════════════════════════════════════
+    // ★★ 起点定向：首段沿**入场速度方向**，避免栅格 45° 量化造成的急转
+    //    （2026-11-16，用户"接着你的思路改"的正解）
+    //
+    // 问题：A* 的 path[1] 是相邻栅格中心，与 path[0] 只差 0.1~0.14m。
+    //   若入场速度方向是 30°，而 path[1]-path[0] 量化到 45° 或 0°，
+    //   这 0.1m 的首段就要承担 15~30° 的转角
+    //   → 曲率 = 2·θ/L ≈ 2×0.5/0.1 = 10 m⁻¹
+    //   → vlim = sqrt(1.2/10) = 0.35 m/s → 减速 → 参考速度方向仍突变。
+    //
+    // 修法：在 path[0] 之后插入一个"引出点"：
+    //   方向 = 入场速度方向（可选时）
+    //   长度 = clamp(0.15, 2×res, 0.35) —— 至少 2 个栅格，够拉开转角
+    //   且**必须安全**（clearance 不低于起点），否则不插。
+    //
+    // 这个点只用于改善轨迹形状，A* 的可行性/最优性完全不变
+    // （路径仍经过它，只是首段被拉直）。
+    // ══════════════════════════════════════════════════════════════════
+    if (has_v_dir && raw.size() >= 2) {
+        const Eigen::Vector3d d0 = raw[1] - raw[0];
+        const double nd0 = d0.head<2>().norm();
+        if (nd0 > 1e-6) {
+            const Eigen::Vector2d t0 = d0.head<2>() / nd0;
+            const double c = std::max(-1.0, std::min(1.0,
+                t0.dot(v_dir.head<2>())));
+            const double ang = std::acos(c) * 180.0 / M_PI;
+            if (ang > 12.0) {          // 首段方向与入场方向差 >12° 才引出
+                // ★ 引出段长度 0.35 → 0.45m（2026-11-17）
+                //
+                // 实测（/tmp/tv0.cpp）：首段长度决定"转向时能否保住速度"
+                //   lead=0.15 + 90° 转角 → 起点速度能被砍到 0.619
+                //   lead=0.35 + 90° 转角 → 1.000
+                // 而首段太短时，即使起点速度保持，**中段速度也会掉**：
+                //   Hermite 在首段内完成 55° 转向 → 速度矢量必须绕过原点
+                //   → 实测 0.086m 首段时 t=0.12s 的 |v| 掉到 0.245
+                // 0.45m 让 55° 转向分摊到足够长的弧长上，|v| 保持 >0.8。
+                const double lead = std::min(0.45, std::max(0.20, 4.5 * params.resolution));
+                Eigen::Vector3d lp = raw[0] + Eigen::Vector3d(v_dir.x(), v_dir.y(), 0.0) * lead;
+                // 保持与路径同一高度层（2D 下尤其重要）
+                lp.z() = raw[0].z();
+                const double lc = field.clearance(lp);
+                const double sc = field.clearance(raw[0]);
+                if (lc >= std::max(0.0, sc - 0.02) &&
+                    (lp - raw[1]).norm() > 0.05) {
+                    raw.insert(raw.begin() + 1, lp);
+                    res.msg = "ok (start direction aligned)";
+                }
+            }
+        }
+    }
+
     res.path = std::move(raw);
     res.success = true;
-    res.msg = "ok";
+    if (res.msg.empty()) res.msg = "ok";
 
     res.length = pathLength(res.path);
     res.clearance_along_path = sampleClearance(res.path, field);
