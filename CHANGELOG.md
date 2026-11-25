@@ -1,5 +1,85 @@
 # Azj Planner 版本记录
 
+## v3.4.8 —— 2026-11-25：yaw_mode 精简为 0/1，修掉一个结构性 bug
+
+### 用户要求
+
+> 现在改一下 yaw_mode 0 是 yaw 跟随路径切线，到点自动朝向打点或者发送的 yaw、
+> 1 是全程不发 yaw 指令，就留这两个就行
+
+### ① 结构性 bug：`yaw_prof->at(traj_t)` 在滚动重建下永远读第一个点
+
+```
+[azj] yaw decision: mode=0 ... target=0.0026° prof_valid=1 traj_t=0.0114
+[azj] yaw_prof: 4 waypoints, range [0°, 30.08°] span 30.08° dur=5.68s
+```
+
+同一时刻曲线里有 30° 的偏航变化，但取出来的目标只有 **0.0026°**。
+
+原因：rolling 每 0.1s 重建一次轨迹，每次 `start = now`
+→ `traj_t = now - start` 永远停在 0~0.14s
+→ 永远读到**第一个 waypoint**（起始机头，≈0°）
+→ yaw 完全不跟随路径。
+
+**yaw_prof 的时间索引在「一条轨迹飞到底」的模式下才成立**（SUPER 就是这样）。
+我们是滚动重建，绝对时间索引结构性失效。
+
+修法：改用**几何切线** —— 当前参考点→前方 0.5m 处的方向（`atan2`），
+与时间索引完全解耦。yaw_prof 降为兜底，再下一级是瞬时速度方向 + `yaw_vel_thresh`。
+
+### ② `YAW_MODE` 环境变量不生效
+
+根因不是优先级写反，而是 `roslaunch` 里 `<rosparam command="load">`
+在命令行 `_param:=` **之后**才应用，把值顶回 yaml：
+
+```
+roslaunch azj_planner azj_planner.launch _azj/yaw_mode:=1
+rosparam get /azj_planner/azj/yaw_mode   ->  0   ← 被 yaml 覆盖
+```
+
+修法：`raicom_azj.sh` 生成 `$SIM_YAML` 后用 sed 写入，rosrun / roslaunch 两条路都确定。
+加写后自校验（不符即 `exit 1`），不再静默跑错模式。
+
+> ⚠ sed 踩坑：`0,/re/s//x/` 的空模式只替换**匹配到的前缀**，
+> 旧值残在行尾变成 `yaw_mode: 1 0` —— yaml 照样合法但值错误。必须显式写完整正则。
+
+### 当前语义
+
+| 值 | 行为 |
+|---|---|
+| `0` | 飞行中跟**路径几何切线**；到点后朝打点/消息给的 yaw |
+| `1` | 全程保持机头（每帧发当前 yaw） |
+
+旧模式号 0~4 自动映射并告警，不再静默改变行为。
+
+**mode=1 的限制**：`PositionCommand.yaw` 是必填字段，`api_3d.cpp` 的 type_mask
+只 `IGNORE_YAW_RATE` 不 `IGNORE_YAW`，协议层做不到「不发」，只能「发不变的值」。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| bench mode=0 | yaw 范围 [0.3°, 27.5°] 跨度 27.2°（narrow 场景含 42° 转弯）|
+| bench mode=1 | yaw 范围 [0.000°, 0.000°] 跨度 0.0°（全程不转）|
+| YAW_MODE 写 yaml | 实起节点读 mode=1 / mode=0 均正确 |
+| 回归 | minco 23 / minco_opt 13 / trajectory 61 / curve 16 / plan_mode 22 全 PASS |
+| PX4 配置 | `MPC_YAWRAUTO_MAX=180` 与 yaml `px4_yaw_auto_max_deg=180` 一致，不触发 clamp |
+
+### ★ 与 v3.4.7 实飞的关键差异
+
+**v3.4.7 实飞时 yaml 是 `yaw_mode: 3`，因上述 bug 机头实际上几乎没转过。
+现在 yaml 是 `0`，机头会真的跟着路径转。**
+
+这是新行为，而 yaw 抢电机行程是历史掉高的来源之一。保护已就位：
+`yaw_rate_flight=0.25`（14°/s）、`yaw_rate_max=1.0`、`yaw_deadband=0.05`、
+`yaw_alt_guard_drop=0.35`。
+
+### 未做
+
+- 真实场景下 mode=0 的 yaw 跟踪**未实飞验证**
+
+---
+
 ## v3.4.7 —— 2026-11-25：v3.4.6 的复验没覆盖到 rolling seg
 
 ### 方向是对的，但只改了一半

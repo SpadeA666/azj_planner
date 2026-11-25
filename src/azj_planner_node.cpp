@@ -996,14 +996,14 @@ private:
 
         // 飞行中要转 yaw，但 PX4 能力不够 → 必然饱和 → 掉高。
         // 这不是"参数没调好"，是会掉机的配置，必须 rror 级别提示。
-        if (np_.yaw_mode != YAW_HOLD && np_.yaw_mode != YAW_HOLD_THEN_MSG) {
+        if (np_.yaw_mode == YAW_PATH_TANGENT) {
             const double headroom = px4_limit > 1e-6 ? np_.yaw_rate_max / px4_limit : 9.9;
             if (headroom > 0.85) {
                 ROS_ERROR("[azj] yaw_mode=%d enables in-flight yaw rotation, but "
                           "yaw_rate_max=%.2f is %.0f%% of PX4 capability (%.2f rad/s). "
                           "PX4 will saturate -> continuous yaw torque -> thrust loss -> "
                           "ALTITUDE DROP. Either run sh/set_px4_yaw.sh to raise the PX4 "
-                          "limit, or set yaw_mode=4 (hold in flight, turn only at goal).",
+                          "limit, or set yaw_mode=1 (hold heading, never rotate).",
                           np_.yaw_mode, np_.yaw_rate_max, 100.0 * headroom, px4_limit);
             }
         }
@@ -2792,6 +2792,22 @@ private:
             snap->traj, 0.5, -1.0,
             robot_state_.rcv ? robot_state_.yaw
                              : std::numeric_limits<double>::quiet_NaN());
+        // ★ yaw 曲线摘要（2026-11-25）：验证 mode=0 是否真的跟随路径切线
+        {
+            const auto& yp = snap->yaw_prof;
+            if (yp.valid()) {
+                double lo = 1e9, hi = -1e9;
+                for (double y : yp.yaw) { lo = std::min(lo, y); hi = std::max(hi, y); }
+                ROS_INFO_STREAM_THROTTLE(
+                    2.0, "[azj] yaw_prof: " << yp.t.size() << " waypoints, range ["
+                             << lo * 180.0 / M_PI << "°, " << hi * 180.0 / M_PI
+                             << "°] span " << (hi - lo) * 180.0 / M_PI << "° dur="
+                             << snap->traj.duration() << "s");
+            } else {
+                ROS_WARN_STREAM_THROTTLE(2.0, "[azj] yaw_prof INVALID (only "
+                                                  << yp.t.size() << " waypoints)");
+            }
+        }
 
         // 原子换上新快照。发布线程要么看到旧轨迹、要么看到新轨迹。
         {
@@ -6084,7 +6100,30 @@ private:
         if (np_.yaw_alt_guard_drop > 1e-3 && robot_state_.rcv) {
             alt_sag = (p.z() - robot_state_.p.z()) > np_.yaw_alt_guard_drop;
         }
-        cmd.yaw = computeYaw(v, dt, goal_local, &snap->yaw_prof, t, alt_sag);
+        // ── 几何切线：当前参考点 → 前方 0.5m 的方向（2026-11-25）──
+        //
+        // 为什么在这里算而不用 yaw_prof：rolling 每 0.1s 重建轨迹，
+        // traj_t 永远停在 0，yaw_prof 的时间索引结构性失效（详见 computeYaw）。
+        //
+        // 前视距离取 0.5m（不是 0.5s）：与速度解耦，慢速时也是"看前方半米"，
+        // 转弯前会提前转。太小（<0.2m）会被轨迹的微摆带着抖；
+        // 太大（>1m）会在急弯处切角、机头超前于实际路径。
+        double tang_yaw = std::numeric_limits<double>::quiet_NaN();
+        {
+            const double dur = snap->traj.duration();
+            const double look = std::min(dur, t + 0.5);   // 近似 0.5m（v≈1m/s）
+            Eigen::Vector3d pc, vc, ac, pa, va, aa;
+            if (snap->traj.sample(t, pc, vc, ac) &&
+                snap->traj.sample(look, pa, va, aa)) {
+                const double dx = pa.x() - pc.x();
+                const double dy = pa.y() - pc.y();
+                if (std::hypot(dx, dy) > 0.05) {   // 方向可靠才用
+                    tang_yaw = std::atan2(dy, dx);
+                }
+            }
+        }
+
+        cmd.yaw = computeYaw(v, dt, goal_local, &snap->yaw_prof, t, alt_sag, tang_yaw);
         cmd.yaw_dot = 0.0;
 
         // backup（刹车）段的诊断标记（2026-11-14，学 SUPER 的 on_backup_traj）。
@@ -6204,12 +6243,23 @@ private:
     }
 
     /// yaw 模式（见 np_.yaw_mode 的说明）
+    ///
+    /// 2026-11-25 精简为两个模式（原 0~4 五个模式已废弃）：
+    ///
+    ///   0 = YAW_PATH_TANGENT  跟随**路径切线**；到点后朝打点/消息给的 yaw
+    ///   1 = YAW_HOLD          全程不发 yaw 变化量（保持当前机头）
+    ///
+    /// 关于"不发 yaw 指令"的技术现实：
+    ///   `quadrotor_msgs/PositionCommand` 的 yaw 字段是必填项，
+    ///   控制器（api_3d.cpp）的 type_mask 只 IGNORE_YAW_RATE、
+    ///   **不 IGNORE_YAW** —— 也就是说 yaw 一定会被当作参考使用。
+    ///   所以"不发"在协议层做不到。mode=1 的实际语义是：
+    ///   **每帧发当前机头（last_yaw_），让控制器看不到任何 yaw 变化**
+    ///   → 飞机不产生偏航力矩 → 不抢电机行程。
+    ///   这与早期实测的"yaw_mode=0 全程不转不掉高"完全等价。
     enum YawMode {
-        YAW_HOLD              = 0,  // 全程不转
-        YAW_VELOCITY          = 1,  // 全程朝速度方向
-        YAW_GOAL              = 2,  // 全程朝目标点（方位角，不跟路径切线）
-        YAW_VELOCITY_THEN_MSG = 3,  // 飞行中朝速度；到点后转成消息朝向
-        YAW_HOLD_THEN_MSG     = 4   // ★ 飞行中不转（省推力）；到点后转成消息朝向
+        YAW_PATH_TANGENT = 0,
+        YAW_HOLD         = 1
     };
 
     /// yaw 参考：固定值优先；否则按 yaw_mode 决定。
@@ -6232,7 +6282,7 @@ private:
     ///   1. goal_yaw 给了固定值 → 用固定值（同样受速率限制）
     ///   2. yaw_follow_velocity=false（默认）→ 机头保持打点那一刻的朝向，不转
     ///   3. yaw_follow_velocity=true → 朝速度方向，但每帧最多转 yaw_rate_max*dt
-    /// @param goal_local  调用方在 state_mtx_ 下快照的 goal（YAW_GOAL 模式用）
+    /// @param goal_local  调用方在 state_mtx_ 下快照的 goal（保留参数，当前模式未用）
     ///
     /// 注意：本函数运行在**发布线程**，而 goal_ 由规划线程（goalCallback）写，
     /// 所以 goal 必须由调用方快照后传入，不能在这里直接读 goal_。
@@ -6240,7 +6290,8 @@ private:
     /// @param traj_t     当前轨迹时刻 [s]，用于查预规划曲线
     double computeYaw(const Eigen::Vector3d& v, double dt, const rog_map::Vec3f& goal_local,
                       const YawProfile* yaw_prof = nullptr, double traj_t = 0.0,
-                      bool alt_sag = false) {
+                      bool alt_sag = false,
+                      double tangent_yaw = std::numeric_limits<double>::quiet_NaN()) {
         // 首次调用用飞机当前机头初始化，避免从 0 开始猛转
         if (!yaw_init_) {
             last_yaw_ = robot_state_.rcv ? robot_state_.yaw : 0.0;
@@ -6258,88 +6309,79 @@ private:
             target = np_.goal_yaw;
             have_target = true;
         } else {
-            // 兼容旧参数：老 yaml 只有 yaw_follow_velocity，没有 yaw_mode。
-            // 打开它就等于 mode=VELOCITY，不能因为新增模式而静默失效。
             // 读运行时值（可由 rosparam set 切换），而非启动时的 np_.yaw_mode
             int mode = yaw_mode_rt_.load();
-            if (np_.yaw_follow_velocity && mode == YAW_HOLD) mode = YAW_VELOCITY;
+
+            // ★ 旧模式号兼容（2026-11-25 精简为 0/1 后）
+            //
+            // 旧语义：0=不转 1=朝速度 2=朝目标 3=朝速度+到点朝消息 4=不转+到点朝消息
+            // 新语义：0=路径切线+到点朝消息  1=不转
+            //
+            // 老配置里常见的 3（默认值）与新的 0 语义最接近 → 映射到 0，只提示一次。
+            // 0/4（不转）→ 1。其余（1/2）没有直接对应，也按 0 处理并明确告警，
+            // 避免静默改变行为。
+            if (mode < 0 || mode > 4) {
+                ROS_WARN_STREAM_THROTTLE(
+                    5.0, "[azj] yaw_mode=" << mode << " unknown, falling back to 0 "
+                             "(path tangent)");
+                mode = YAW_PATH_TANGENT;
+            } else if (mode != YAW_PATH_TANGENT && mode != YAW_HOLD) {
+                const int mapped = (mode == 0 || mode == 4) ? YAW_HOLD : YAW_PATH_TANGENT;
+                ROS_WARN_STREAM_THROTTLE(
+                    5.0, "[azj] yaw_mode=" << mode
+                             << " is a legacy value (modes are now 0/1 only); mapping to "
+                             << mapped << ". Please set yaw_mode to 0 or 1.");
+                mode = mapped;
+            }
+
+            // 老参数 yaw_follow_velocity 的兼容：打开它就等价于"飞行中要转"，
+            // 即新语义的 0。仅在用户显式设成 true 时生效（默认 false）。
+            if (np_.yaw_follow_velocity && mode == YAW_HOLD) {
+                ROS_WARN_STREAM_THROTTLE(
+                    5.0, "[azj] yaw_follow_velocity=true overrides yaw_mode=1 -> 0");
+                mode = YAW_PATH_TANGENT;
+            }
 
             switch (mode) {
-                case YAW_VELOCITY: {
-                    // ★ 优先用**预规划的 yaw 曲线**（照 SUPER 做法）。
-                    //
-                    // 为什么不用瞬时速度方向（旧写法，会掉高）：
-                    //   柱林里速度方向每帧都在变（路径左右摆），
-                    //   参考一直抖 → PX4 一直追 → 实测稳态落后 26~30°
-                    //   → 持续偏航力矩占用电机行程 → 推力不足 → 掉高。
-                    //
-                    // 预规划曲线的 yaw 是**前视 0.5s 的平均方向**，
-                    // 宏观且平滑，PX4 跟得上，不产生持续力矩。
-                    if (yaw_prof && yaw_prof->valid()) {
-                        target = yaw_prof->at(traj_t);
-                        have_target = true;
-                    } else {
-                        // 兜底（曲线不可用时）：退回瞬时速度方向 + 门限
-                        const double spd = std::hypot(v.x(), v.y());
-                        if (spd > np_.yaw_vel_thresh) {
-                            target = std::atan2(v.y(), v.x());
-                            have_target = true;
-                        }
-                    }
-                    break;
-                }
-                case YAW_GOAL: {
-                    // 朝目标点。到点附近（<0.3m）方向不可靠，不转。
-                    // robot_state_.p 由 rog_map 的 odom 回调（spinner 线程）写，
-                    // 这里读存在理论竞争。但：①写入只是 3 个 double，撕裂概率极低；
-                    // ②默认 yaw_mode=VELOCITY 不走这条路；
-                    // ③若真的读到旧值，后果只是机头方向略偏，不涉及安全。
-                    // 要彻底消除得给 rog_map 加锁，那违背"不改其源码"的原则。
-                    const double dx = goal_local.x() - robot_state_.p.x();
-                    const double dy = goal_local.y() - robot_state_.p.y();
-                    if (std::hypot(dx, dy) > 0.30) {
-                        target = std::atan2(dy, dx);
-                        have_target = true;
-                    }
-                    break;
-                }
-                case YAW_HOLD_THEN_MSG: {
-                    // 飞行中完全不转，只在到点后转成消息朝向。
-                    //
-                    // ★ 为什么这是安全的 yaw 方案（2026-11-05 实测结论）：
-                    //   PX4 四旋翼的每个电机都叠加 throttle/roll/pitch/yaw 四个分量
-                    //   （quad_x mixer），**持续的偏航力矩会占用电机行程**。
-                    //   飞行中朝速度方向意味着 yaw 参考一直在变（柱林里速度方向
-                    //   频繁变化），姿态环要持续输出偏航力矩，推力裕度被吃掉
-                    //   → 实测 sp_vz 顶在 +0.70 限幅而 z 从 0.9 掉到 0.0。
-                    //
-                    //   对照实验也印证：yaw_mode=0（全程不转）同样场景不掉高。
-                    //
-                    //   收益对比：本项目的雷达是 360° 全向（Mid360 / unitree），
-                    //   "机头朝飞行方向"带来的视野收益很小；而掉高是安全问题。
-                    //   所以飞行段不转，只在到点后（此时速度≈0，无速度需求竞争）
-                    //   转向指定朝向 —— 既满足投放/拍照对正，又不吃飞行推力。
+                case YAW_PATH_TANGENT: {
+                    // 到点后优先朝消息给的方向（投放/拍照要求机头对正）
                     if (arrived_ && msg_yaw_valid_) {
                         target = msg_yaw_;
                         have_target = true;
+                        break;
                     }
-                    break;
-                }
-                case YAW_VELOCITY_THEN_MSG: {
-                    // 两段式：飞行中朝速度方向，到位后转成打点消息给的朝向。
+                    // 飞行中：跟随**路径切线**。
                     //
-                    // 为什么这个组合最实用：
-                    //   穿越时要朝前（看得到要飞的方向、雷达正视障碍）；
-                    //   但到点后要保持一个**指定**朝向（投放/拍照/对接要求机头对正）。
-                    // 单一模式做不到这两件事：VELOCITY 到点后速度归零就冻结在
-                    // 最后一个速度方向，FROM_MSG 飞行中又用不上（那是终点朝向）。
-                    if (arrived_ && msg_yaw_valid_) {
-                        target = msg_yaw_;
+                    // ★★★ 必须用 tangent_yaw（几何切线），不能用 yaw_prof[traj_t]
+                    //     （2026-11-25 实测定位的结构 bug）
+                    //
+                    // 事故：`yaw_prof->at(traj_t)` 永远返回 0°。
+                    //   日志：`yaw decision: mode=0 ... target=0.00°
+                    //          prof_valid=1 traj_t=0.011`
+                    //   而同一时刻 `yaw_prof: 4 waypoints, range [0°, 30°]`。
+                    //
+                    //   ？因为 rolling 每 0.1s 重建一次轨迹，每次 `start = now`
+                    //   → `traj_t = now - start` 永远停在 0~0.1s
+                    //   → 永远读到第一个 waypoint（起始机头，≈0°）
+                    //   → yaw 完全不跟随路径，飞行中转不转都一样。
+                    //
+                    //   yaw_prof 的时间索引在"轨迹一次性跑完"的模式下才成立
+                    //   （SUPER 就是这样：一条轨迹飞到底）。我们是滚动重建，
+                    //   绝对时间索引结构性失效。
+                    //
+                    // 修法：用**几何切线** —— 取当前参考点前方 0.5m 处的方向。
+                    //   与时间索引无关，rolling 重建多少次都不影响。
+                    //   0.5m 前视是平滑的关键（不是逐帧速度方向），
+                    //   避免柱林里速度噪声导致的机头抖动。
+                    if (std::isfinite(tangent_yaw)) {
+                        target = tangent_yaw;
                         have_target = true;
                     } else if (yaw_prof && yaw_prof->valid()) {
+                        // 兜底：几何切线不可用时退回预规划曲线
                         target = yaw_prof->at(traj_t);
                         have_target = true;
                     } else {
+                        // 兜底：曲线不可用时退回瞬时速度方向 + 速度门限
                         const double spd = std::hypot(v.x(), v.y());
                         if (spd > np_.yaw_vel_thresh) {
                             target = std::atan2(v.y(), v.x());
@@ -6350,9 +6392,22 @@ private:
                 }
                 case YAW_HOLD:
                 default:
-                    break;   // 不转，保持 last_yaw_
+                    // 不产生 yaw 变化量：have_target 保持 false →
+                    // 函数末尾 `if (!have_target) return last_yaw_`
+                    // → 每帧都发当前机头，控制器看不到变化。
+                    break;
             }
         }
+
+        ROS_INFO_STREAM_THROTTLE(
+            2.0, "[azj] yaw decision: mode=" << yaw_mode_rt_.load()
+                     << " arrived=" << (arrived_ ? 1 : 0)
+                     << " msg_yaw_valid=" << (msg_yaw_valid_ ? 1 : 0)
+                     << " have_target=" << (have_target ? 1 : 0)
+                     << " target=" << (have_target ? target * 180.0 / M_PI : 0.0)
+                     << "° last_yaw=" << last_yaw_ * 180.0 / M_PI << "°"
+                     << " prof_valid=" << ((yaw_prof && yaw_prof->valid()) ? 1 : 0)
+                     << " traj_t=" << traj_t);
 
         if (!have_target) return last_yaw_;
 
