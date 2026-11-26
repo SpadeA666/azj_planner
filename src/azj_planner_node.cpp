@@ -217,6 +217,14 @@ public:
 
         ROS_INFO("[azj] plan_mode=%s (runtime switch: rosparam set /azj_planner/plan_2d true|false)",
                  np_.plan_2d ? "2D (XY only)" : "3D");
+        // ★ 把配置里的 plan_2d 同步给 plan_2d_active_（2026-11-26）。
+        //
+        // 原来 plan_2d_active_ 初值写死 false，要等 replanCallback 第一次
+        // 跑完 2D/3D 解析（约 4917 行）才变成 true。于是**启动后第一帧**
+        // 一直按 3D 逻辑处理起点（抬到 floor+0.05），那一帧必然拒规划。
+        // 更阴的是日志会先打一条 “lifted to 0.05 (clearance=0)”，
+        // 让人以为是 3D 的贴地问题，而实际是模式标记滞后。
+        plan_2d_active_ = np_.plan_2d;
         if (np_.plan_2d) {
             if (np_.plan_2d_slab_half <= 1e-6) {
                 ROS_INFO("[azj]   2D: z locked at goal height, single-slice ESDF "
@@ -4852,6 +4860,36 @@ private:
             // ══════════════════════════════════════════════════════════
             const double kClear = 0.05;
             if (start.z() - zlo < kClear) {
+                // ══════════════════════════════════════════════════════════
+                // ★★ 2D 模式：起点必须抬到**规划平面**（2026-11-26 修）
+                //
+                // 2D 的语义是“飞机严格在 z_plane 上飞”：A* 的每一个邻居
+                // 都被强制设到 `plan_2d_z_active_`（见 1789 行
+                // `if (plan_2d_active_) cand.z() = plan_2d_z_active_`）。
+                //
+                // 但起点原来只在 zlo+0.05 ~ zlo+0.40 里找间隙，**根本不在
+                // 那个平面上**。飞机停在地面时：
+                //   · z=0.05 一带：地面点云 + 机体自反射 → clearance=0
+                //   · 抬到 0.40 仍然为 0（反射就在这个范围内）
+                //   → path_search 的 `start_clr > 0` 为假
+                //   → “start is deeply inside an obstacle” → 拒规划
+                //
+                // 用户在地面用地面站打点时，看到的症状就是
+                // **一条路径都不出**（/azj/path 从未发布 → 连频道都不广播）。
+                // 而 z=goal.z()（如 0.85）那一层的 ESDF 其实很空 ——
+                // 只是代码从来没去那里查过。
+                //
+                // 修法：2D 模式直接把起点设到 goal.z()，与 A* 邻居对齐。
+                // 3D 模式保持原逻辑（必须真的找到间隙，否则抬上去也不安全）。
+                // ══════════════════════════════════════════════════════════
+                const bool lock2d = plan_2d_active_ && (goal.z() - zlo > kClear);
+                if (lock2d) {
+                    ROS_WARN_STREAM_THROTTLE(
+                        2.0, "[azj] 2D: start z="
+                                 << start.z() << " below plan plane; locked to z=" << goal.z()
+                                 << " (same plane as A* neighbours) — not a bug");
+                    start.z() = goal.z();
+                } else {
                 const double lift_max = std::max(kClear, np_.ground_lift_max);
                 double lift = kClear;
                 double best_lift = kClear;
@@ -4869,6 +4907,7 @@ private:
                                           << " (clearance=" << best_clr
                                           << ", searched up to +" << lift_max << "m)");
                 start.z() = zlo + best_lift;
+                }
             }
             if (zhi - start.z() < kClear) {
                 start.z() = zhi - kClear;
