@@ -135,8 +135,10 @@ azj:
   vel_topic: ""
   # odom.twist 是否在**机体系**（实机 faster_lio 是，仿真 gazebo 真值不是）。
   #   仿真 /gazebo_truth/odom  → false（世界系，gz_truth_bridge 直接透传）
-  #   实机 /Odometry_highrate   → **true**（laser_mapping.cc 里 rot.conjugate()*vel）
+  #   实机 /Odometry_highrate   → **true**（laser_mapping.cc:809 里 rot.conjugate()*vel）
   # ⚠ 当世界系用错时，飞机偏航后速度方向就错 → 轨迹起点速度错。
+  # ⚠ TF 救不了这个：TF 管坐标系连通，不管消息字段的语义。
+  #   详细对比（含 SUPER / as_controller 为何不受影响）见 PARAMETERS.md 第 11.5 节。
   odom_twist_body: false
   goal_topic: "/move_base_simple/goal"
   path_topic: "/azj/path"           # nav_msgs/Path，latched

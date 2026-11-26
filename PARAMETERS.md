@@ -396,7 +396,6 @@ SUPER 的 "guide 段 + backup" 在 azj 上的等价实现。
 ---
 
 ## 11. 搜索 / 建图 / 输出
-
 ### A* 搜索
 
 | 参数 | 默认 | 含义 |
@@ -435,6 +434,7 @@ SUPER 的 "guide 段 + backup" 在 azj 上的等价实现。
 | `goal_topic` | `/move_base_simple/goal` | 目标输入（与 SUPER 相同） |
 | `frame_id` | `map` | |
 | `vel_topic` | `""` | 空 = 从建图 odom 的 twist 取速度（推荐，位姿/速度同源） |
+| `odom_twist_body` | false | 建图 odom 的 twist 是否在**机体系**（实机 faster_lio 是，仿真 gazebo 不是） |
 | `arrive_tol` | 0.15 | 到达判定距离 [m] |
 | `arrive_vel_tol` | 0.20 | 到达判定速度上限 [m/s] |
 | `vel_blend_time` | 0.35 | 速度淡入时间 [s]。**rolling 下自动禁用** |
@@ -464,6 +464,76 @@ SUPER 的 "guide 段 + backup" 在 azj 上的等价实现。
 | `curve_enable_local_centering` | true | 局部居中 |
 | `curve_local_scan_radius` | 2.0 | 局部扫描半径 [m] |
 | `curve_sample_step` | 0.05 | 采样步长 [m] |
+
+---
+
+## 11.5 ★ odom 速度的坐标系陷阱（实机移植必读）
+
+`vel_topic` 留空时，速度从建图 odom 的 `twist` 取。
+但**不同来源的 twist 坐标系不一样**，搞错会让飞机偏航后速度方向全错。
+
+### 三类 odom 源的实际语义（均已核代码）
+
+| 来源 | twist 坐标系 | 依据 |
+|---|---|---|
+| 仿真 `/gazebo_truth/odom` | **世界系** ENU | `gz_truth_bridge.py:92` 直接透传 gazebo `msg.twist[i]` |
+| 实机 `/Odometry_highrate`（faster_lio） | **机体系** | `laser_mapping.cc:809`：<br>`vel_body = s.rot.conjugate() * s.vel`<br>（注释原话“转到 body 系，更符合 child_frame_id”）|
+| `/mavros/local_position/velocity_local` | **世界系** ENU | mavros 约定 |
+
+### 为什么 TF 救不了这个问题
+
+板卡上用 `static_transform_publisher 0 0 0 0 0 0 map odom`（零变换）
+解决的是**TF 树连通性**——让不同坐标系名字能连上，rviz 能对齐。
+
+但 twist 坐标系问题是**消息字段的语义标注错误**：
+
+```
+飞机机头朝北（yaw=90°），实际向前飞 0.5 m/s
+faster_lio 发:  twist.linear = (0.5, 0, 0)   ← 机体系 x = 前向
+azj 当成世界系读 → 认为飞机在向东飞 0.5 m/s   ← 错
+正确世界系应该是: (0, 0.5, 0)                ← 向北
+```
+
+整个过程**没有任何 TF 查询**（直接读消息字段），所以 TF 无从介入。
+这不是坐标系变换问题，是协议约定问题。
+
+### 为什么只有 azj 需要处理
+
+| 节点 | 速度来源 | 受影响？ |
+|---|---|---|
+| **SUPER** | 通过 rog_map 拿 odom | **否**。`rog_map_ros1.hpp:74` 的 odomCallback **只读 pose**，不碰 twist；<br>`ROGMap::updateRobotState`（`rog_map.cpp:268`）也只填 `p/q/yaw`，`v` 永远是 0 |
+| **as_controller** | `/mavros/local_position/velocity_local` | **否**。这是 ENU 世界系（`api_3d.cpp:2465`）|
+| **azj（修前）** | 自订 `/Odometry_highrate` 的 twist | **是**。直接当世界系用 → 偏航后速度方向错 |
+
+> 换句话说：**SUPER 从来没这个问题，是因为它从来不用速度**（起点速度恒为 0）。
+> 这也侧面解释了为什么 SUPER 的轨迹总是“从静止起步”——它本来就没做速度继承。
+
+### 三种解决方式的对比
+
+| 方案 | 同源？ | 侵入性 | 评价 |
+|---|---|---|---|
+| **`odom_twist_body: true`**（当前） | ✓ 位姿与速度同一帧消息 | 一个小参数 | **推荐**。只多一次旋转，数学无损 |
+| `vel_topic: /mavros/local_position/velocity_local` | ✗ 位姿 faster_lio、速度 PX4 EKF | 不改代码 | 可行但违背“严格同源”设计；两源可能有 2~9cm 错动与延迟差 |
+| 清空 twist 当 0 | — | — | 不可取。重规划时每次都从静止起步（azj 早期就是这个毛病）|
+
+### 验证方法
+
+启动日志会明确标注实际走的是哪条路：
+
+```
+[azj] velocity from odom twist (/Odometry_highrate) [body->world converted]
+                                                  ↑ true 时有这个标记
+[azj] velocity from odom twist (/gazebo_truth/odom)
+                                                  ↑ 仿真（世界系，不需转换）
+```
+
+旋转公式已做数值验证（6 个边界用例全通过，含 yaw=0/±90/180、侧向飞、垂直飞、
+零四元数保护）：
+
+```cpp
+Eigen::Quaterniond quat(q.w, q.x, q.y, q.z);
+if (quat.norm() > 1e-6) v = quat.normalized() * v;   // body → world
+```
 
 ---
 
