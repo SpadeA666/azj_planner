@@ -127,7 +127,8 @@ public:
             // 从建图用的同一个 odom 话题取 twist —— 位姿与速度同源
             odom_vel_sub_ = nh_.subscribe(cfg_.odom_topic, 10,
                                           &AzjPlannerNode::odomTwistCallback, this);
-            ROS_INFO("[azj] velocity from odom twist (%s)", cfg_.odom_topic.c_str());
+            ROS_INFO("[azj] velocity from odom twist (%s)%s", cfg_.odom_topic.c_str(),
+                     np_.odom_twist_body ? " [body->world converted]" : "");
         }
 
         // latch=true：rviz 晚于规划器启动时也能立刻看到最后一次的路径/目标，
@@ -268,6 +269,17 @@ private:
         // 这样仿真(/gazebo_truth/odom)和真机(mavros odom)都不用额外配置前缀，
         // 且与建图位姿严格同源（不会出现"位置用 A、速度用 B"的错配）。
         std::string vel_topic{""};
+        /// odom.twist 是否在**机体系**下（2026-11-26 实机移植新增）。
+        ///
+        /// 两类来源语义不同，必须区分：
+        ///   false（仿真 /gazebo_truth/odom）：gz_truth_bridge 直接透传 gazebo 的
+        ///         model_states twist → **世界系**（ENU）
+        ///   true（实机 faster_lio /Odometry_highrate）：FillOdomFromState 里
+        ///         `s.rot.conjugate() * s.vel` → **机体系**（注释写"更符合 child_frame_id"）
+        ///
+        /// 当世界系用错了，飞机会在偏航后速度方向错 → 轨迹起点速度错。
+        /// 机体系时用 odom.pose 的朝向转回世界系。
+        bool odom_twist_body{false};
         std::string frame_id{"map"};
         bool unknown_as_free{false};
         double free_clearance_if_unknown{0.5};
@@ -1109,6 +1121,7 @@ private:
                 str("marker_topic", np_.marker_topic);
                 str("cmd_topic", np_.cmd_topic);
                 str("vel_topic", np_.vel_topic);
+                bln("odom_twist_body", np_.odom_twist_body);
                 str("frame_id", np_.frame_id);
                 bln("unknown_as_free", np_.unknown_as_free);
                 dbl("free_clearance_if_unknown", np_.free_clearance_if_unknown);
@@ -1256,6 +1269,7 @@ private:
         pnh_.param("azj/marker_topic", np_.marker_topic, np_.marker_topic);
         pnh_.param("azj/cmd_topic", np_.cmd_topic, np_.cmd_topic);
         pnh_.param("azj/vel_topic", np_.vel_topic, np_.vel_topic);
+        pnh_.param("azj/odom_twist_body", np_.odom_twist_body, np_.odom_twist_body);
         pnh_.param("azj/frame_id", np_.frame_id, np_.frame_id);
         pnh_.param("azj/unknown_as_free", np_.unknown_as_free, np_.unknown_as_free);
         pnh_.param("azj/free_clearance_if_unknown", np_.free_clearance_if_unknown,
@@ -1576,10 +1590,26 @@ private:
         return d;
     }
 
-    /// 从 odom 的 twist 取世界系速度（ENU，不要再转机体系）。
+    /// 从 odom 的 twist 取速度。
+    ///
+    /// ⚠ 两类 odom 源的 twist 坐标系不同（2026-11-26 实机移植发现）：
+    ///   仿真 /gazebo_truth/odom  → 世界系（gazebo 直接透传）
+    ///   实机 faster_lio /Odometry_highrate → **机体系**
+    ///     （laser_mapping.cc: `vel_body = s.rot.conjugate() * s.vel`）
+    /// 机体系时必须用同一消息里的 pose.orientation 转回世界系，
+    /// 否则飞机一偏航，速度方向就错了（轨迹起点速度直接错）。
     void odomTwistCallback(const nav_msgs::OdometryConstPtr& msg) {
-        current_vel_ = Eigen::Vector3d(msg->twist.twist.linear.x, msg->twist.twist.linear.y,
-                                       msg->twist.twist.linear.z);
+        Eigen::Vector3d v(msg->twist.twist.linear.x, msg->twist.twist.linear.y,
+                          msg->twist.twist.linear.z);
+        if (np_.odom_twist_body) {
+            // 机体系 → 世界系：v_world = R(q) * v_body
+            const auto& q = msg->pose.pose.orientation;
+            Eigen::Quaterniond quat(q.w, q.x, q.y, q.z);
+            if (quat.norm() > 1e-6) {
+                v = quat.normalized() * v;
+            }
+        }
+        current_vel_ = v;
         vel_received_ = true;
     }
 

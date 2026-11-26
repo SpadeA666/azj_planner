@@ -17,14 +17,15 @@ rog_map:
   #   导致 l_miss 为正（"空闲"格子反而增加占据概率）→ 地图糊成一坨。
   resolution: 0.10
   inflation_resolution: 0.10
-  # ⚠ 当前值是 3，但注释历史上一再说"必须是 1"——两者矛盾，已核实：
-  #   此值会双向侵蚀 virtual_ground/ceil（各吃 step×res 米）。
-  #   设 3 = 各吃 0.3m。下面 virtual_ceil_height 的注释里写的是
-  #   "inflation_step=1 时 ceil 1.8 → eff 1.65"（即按 1 推算的）。
-  #   → 实际生效以启动日志 "resetMapSize: virtual_ceil_height: X" 为准，
-  #     不要相信这里的推算。要改就确认日志后再改，改动会影响建图行为。
-  #   膨胀职责应交给规划器的 robot_radius，别让建图参数兼职。
-  inflation_step: 3
+  # ⚠ 必须是 1（实机 2026-11-26 验证）。此值会双向侵蚀 virtual_ground/ceil：
+  #   ground_eff = ground + step×res    ceil_eff = ceil - step×res
+  #   实机实测：
+  #     step=3 → ground_eff = -0.3+0.3 = **0.0**
+  #        → 飞机贴地时 rog_map 报 'Odom below virtual ground' 并**跳过帧**
+  #        → 建图失效 → 规划器无数据 → 完全不能用（节点自检会打 FATAL）
+  #     step=1 → ground_eff = -0.15、ceil_eff = 1.65  ✓（启动日志已确认）
+  #   膨胀职责交给规划器的 robot_radius，别让建图参数兼职。
+  inflation_step: 1
   unk_inflation_en: false
   unk_inflation_step: 1
   map_size: [ 15, 15, 6 ]
@@ -132,6 +133,11 @@ azj:
   cmd_topic: "/planning/pos_cmd"
   # 留空 = 从建图用的那个 odom 的 twist 取速度（推荐，位姿/速度同源）。
   vel_topic: ""
+  # odom.twist 是否在**机体系**（实机 faster_lio 是，仿真 gazebo 真值不是）。
+  #   仿真 /gazebo_truth/odom  → false（世界系，gz_truth_bridge 直接透传）
+  #   实机 /Odometry_highrate   → **true**（laser_mapping.cc 里 rot.conjugate()*vel）
+  # ⚠ 当世界系用错时，飞机偏航后速度方向就错 → 轨迹起点速度错。
+  odom_twist_body: false
   goal_topic: "/move_base_simple/goal"
   path_topic: "/azj/path"           # nav_msgs/Path，latched
   marker_topic: "/azj/path_marker"
